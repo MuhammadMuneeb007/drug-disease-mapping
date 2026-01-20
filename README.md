@@ -1,10 +1,13 @@
+```markdown
 # Drug-Disease Association Data Pipeline
 
 A comprehensive pipeline for downloading, processing, and merging drug-disease associations from multiple public biomedical databases. This repository integrates data from 7 major sources to create a unified drug-disease association dataset for pharmaceutical research and computational biology applications.
 
-Data link
- 10.5281/zenodo.18308460
- 
+## Data (Zenodo)
+
+- **DOI:** https://doi.org/10.5281/zenodo.18308460  
+- **Zenodo record:** https://zenodo.org/records/18308460  
+
 ---
 
 ## Table of Contents
@@ -19,6 +22,7 @@ Data link
 - [Usage](#usage)
 - [Requirements](#requirements)
 - [License & Citations](#license--citations)
+- [Contact & Support](#contact--support)
 
 ---
 
@@ -89,14 +93,15 @@ This pipeline systematically:
 ## Pipeline Architecture
 
 ```
+
 ┌─────────────────────────────────────────────────────────────────┐
 │                    DATA ACQUISITION LAYER                        │
 ├─────────────────────────────────────────────────────────────────┤
 │  aact.py │ chembl.py │ ctd.py │ drugcentral.py │ opentargets.py │
 │                    sider.py                                      │
 └────────────────────┬────────────────────────────────────────────┘
-                     │
-                     ▼
+│
+▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                  STANDARDIZATION LAYER                           │
 ├─────────────────────────────────────────────────────────────────┤
@@ -104,8 +109,8 @@ This pipeline systematically:
 │  • Source tracking (source, internal_source)                    │
 │  • Schema harmonization                                         │
 └────────────────────┬────────────────────────────────────────────┘
-                     │
-                     ▼
+│
+▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                    MERGING LAYER                                 │
 ├─────────────────────────────────────────────────────────────────┤
@@ -113,19 +118,72 @@ This pipeline systematically:
 │  • Text normalization (lowercase, strip whitespace)             │
 │  • Source annotation preservation                               │
 └────────────────────┬────────────────────────────────────────────┘
-                     │
-                     ├──────────────────────────────────┐
-                     ▼                                  ▼
-        ┌────────────────────────┐      ┌─────────────────────────┐
-        │   MERGED DATASET       │      │  DEDUPLICATED DATASET   │
-        ├────────────────────────┤      ├─────────────────────────┤
-        │ 5,107,064 rows         │      │ 4,148,850 rows          │
-        │ All associations       │      │ Unique combinations     │
-        └────────────────────────┘      └─────────────────────────┘
+│
+├──────────────────────────────────┐
+▼                                  ▼
+┌────────────────────────┐      ┌─────────────────────────┐
+│   MERGED DATASET       │      │  DEDUPLICATED DATASET   │
+├────────────────────────┤      ├─────────────────────────┤
+│ 5,107,064 rows         │      │ 4,148,850 rows          │
+│ All associations       │      │ Unique combinations     │
+└────────────────────────┘      └─────────────────────────┘
+
 ```
 
 ---
- 
+
+## File Structure
+
+```
+
+AllDiseasesToDrugs/
+├─ DownloadAllDrugs/
+│  ├─ aact.py
+│  ├─ chembl.py
+│  ├─ ctd.py
+│  ├─ drugcentral.py
+│  ├─ opentargets.py
+│  ├─ sider.py
+│  └─ (downloaded raw source files / caches as applicable)
+├─ mergeDrugs.py
+├─ AllDiseasesToDrugs.py
+├─ README.md
+└─ output/
+├─ aact_drug_disease.csv
+├─ chembl.csv
+├─ ctd_drug_disease.csv
+├─ ctgov_drug_disease.csv
+├─ drugcentral_drug_disease.csv
+├─ opentargets_drug_disease.csv
+├─ sider_drug_indication.csv
+├─ ALL_SOURCES_drug_disease_merged.csv
+├─ ALL_SOURCES_drug_disease_deduplicated.csv
+└─ migraine_drugs.csv
+
+```
+
+---
+
+## Data Processing Scripts
+
+### Downloaders (per-source)
+- `DownloadAllDrugs/aact.py` — downloads/derives trial intervention–condition mappings from AACT / ClinicalTrials.gov
+- `DownloadAllDrugs/chembl.py` — extracts drug–indication mappings and phase information from ChEMBL SQLite
+- `DownloadAllDrugs/ctd.py` — processes CTD chemical–disease associations (curated + inferred)
+- `DownloadAllDrugs/drugcentral.py` — queries DrugCentral (PostgreSQL-backed) for indications/contraindications
+- `DownloadAllDrugs/opentargets.py` — pulls Open Targets drug–disease associations (may use `chembl.csv` for name harmonization)
+- `DownloadAllDrugs/sider.py` — parses SIDER indications extracted from labels
+
+### Merging
+- `mergeDrugs.py` — standardizes, concatenates, annotates sources, and exports merged + deduplicated CSVs
+
+### Bulk pipeline runner
+- `AllDiseasesToDrugs.py` — end-to-end orchestration:
+  1. download all sources
+  2. normalize/standardize
+  3. generate unified SQLite (if configured)
+  4. export CSV/Parquet outputs
+
 ---
 
 ## Output Files
@@ -133,24 +191,32 @@ This pipeline systematically:
 ### Primary Outputs
 
 #### **ALL_SOURCES_drug_disease_merged.csv** (5,107,064 rows)
+
 ```
+
 Purpose:     Complete merged dataset with all associations
-Schema:      drug_name, disease_name, source, internal_source, drug_id, 
-             disease_id, extra_metadata
-Features:    
-  - Preserves all source-specific metadata in JSON format
-  - Includes duplicate associations from multiple sources
-  - Annotates each row with source provenance
+Schema:      drug_name, disease_name, source, internal_source, drug_id,
+disease_id, extra_metadata
+Features:
+
+* Preserves all source-specific metadata in JSON format
+* Includes duplicate associations from multiple sources
+* Annotates each row with source provenance
+
 ```
 
 #### **ALL_SOURCES_drug_disease_deduplicated.csv** (4,148,850 rows)
+
 ```
+
 Purpose:     Deduplicated dataset for analysis
 Schema:      drug_name, drug_id, disease, source, internal_source
-Features:    
-  - Unique (drug_name, drug_id, disease) combinations
-  - Removes ~20% redundancy from merged dataset
-  - Maintains first-occurrence source attribution
+Features:
+
+* Unique (drug_name, drug_id, disease) combinations
+* Removes ~20% redundancy from merged dataset
+* Maintains first-occurrence source attribution
+
 ```
 
 ### Source-Specific Files
@@ -168,21 +234,26 @@ Features:
 ### Domain-Specific Subsets
 
 #### **migraine_drugs.csv** (5,049 rows)
+
 ```
+
 Purpose:     Migraine-specific drug associations
-Schema:      drug_name, drug_id, n_migraine_rows, unique_disease_terms, 
-             sources, internal_sources
-Features:    
-  - Aggregates all migraine-related associations
-  - Counts occurrences across sources
-  - Lists all associated sources per drug
+Schema:      drug_name, drug_id, n_migraine_rows, unique_disease_terms,
+sources, internal_sources
+Features:
+
+* Aggregates all migraine-related associations
+* Counts occurrences across sources
+* Lists all associated sources per drug
+
 ```
 
 ---
- 
-### Data Quality Metrics
+
+## Data Quality Metrics
 
 ```
+
 Total Sources:              7
 Original Row Count:         14,433,231 (all individual CSVs)
 After Source Processing:    5,107,064
@@ -191,7 +262,31 @@ Deduplication Rate:         18.8%
 Unique Drugs:               ~200,000
 Unique Diseases:            ~50,000
 Sources Per Drug (avg):     2.3
-```
+
+````
+
+---
+
+## Merging Methodology
+
+1. **Standardize schemas**
+   - Normalize column names and types across sources
+   - Ensure presence of core fields (drug, disease, source provenance)
+
+2. **Normalize text**
+   - Lowercase drug/disease strings
+   - Strip whitespace / clean common formatting issues
+
+3. **Preserve provenance**
+   - Add `source` and `internal_source` annotations
+   - Store source-specific extra fields in `extra_metadata` (JSON) where applicable
+
+4. **Merge**
+   - Vertical concatenation of standardized tables (Polars)
+
+5. **Deduplicate**
+   - Collapse duplicates to unique `(drug_name, drug_id, disease)` (or equivalent harmonized key)
+   - Keep first-occurrence provenance fields for traceability
 
 ---
 
@@ -218,7 +313,7 @@ python opentargets.py --chembl chembl.csv --out opentargets_drug_disease.csv
 
 # Download SIDER data
 python sider.py --out sider_drug_indication.csv
-```
+````
 
 ### Merging All Sources
 
@@ -241,7 +336,9 @@ python AllDiseasesToDrugs.py ./output_directory
 # 3. Create unified SQLite database
 # 4. Export CSV and Parquet files
 ```
- 
+
+---
+
 ## Requirements
 
 ### Python Dependencies
@@ -252,14 +349,14 @@ pip install requests pandas polars duckdb psycopg2-binary pyarrow
 
 ### Individual Package Requirements
 
-- **aact.py:** `duckdb`, `requests`
-- **chembl.py:** `sqlite3`, `pandas`, `tarfile`
-- **ctd.py:** `pandas`, `requests`, `gzip`
-- **drugcentral.py:** `psycopg2-binary`
-- **opentargets.py:** `requests`, `pandas`, `pyarrow`
-- **sider.py:** `pandas`, `requests`
-- **mergeDrugs.py:** `polars`
- 
+* **aact.py:** `duckdb`, `requests`
+* **chembl.py:** `sqlite3`, `pandas`, `tarfile`
+* **ctd.py:** `pandas`, `requests`, `gzip`
+* **drugcentral.py:** `psycopg2-binary`
+* **opentargets.py:** `requests`, `pandas`, `pyarrow`
+* **sider.py:** `pandas`, `requests`
+* **mergeDrugs.py:** `polars`
+
 ---
 
 ## License & Citations
@@ -268,47 +365,60 @@ pip install requests pandas polars duckdb psycopg2-binary pyarrow
 
 Each data source has its own license terms:
 
-- **AACT/ClinicalTrials.gov:** Public domain (U.S. Government)
-- **ChEMBL:** Creative Commons Attribution-ShareAlike 3.0 Unported License
-- **CTD:** Free for academic and commercial use with attribution
-- **DrugCentral:** Creative Commons Attribution-ShareAlike 4.0
-- **Open Targets:** Creative Commons Attribution 4.0
-- **SIDER:** Creative Commons Attribution-NonCommercial-ShareAlike 4.0
-- **ClinicalTrials.gov:** Public domain
+* **AACT/ClinicalTrials.gov:** Public domain (U.S. Government)
+* **ChEMBL:** Creative Commons Attribution-ShareAlike 3.0 Unported License
+* **CTD:** Free for academic and commercial use with attribution
+* **DrugCentral:** Creative Commons Attribution-ShareAlike 4.0
+* **Open Targets:** Creative Commons Attribution 4.0
+* **SIDER:** Creative Commons Attribution-NonCommercial-ShareAlike 4.0
+* **ClinicalTrials.gov:** Public domain
 
-### Citations
+### Dataset citation (Zenodo)
+
+```bibtex
+@dataset{muneeb_drug_disease_2026,
+  author       = {Muneeb, Muhammad},
+  title        = {Drug-Disease Association Data Pipeline and Unified Dataset},
+  year         = {2026},
+  publisher    = {Zenodo},
+  doi          = {10.5281/zenodo.18308460},
+  url          = {https://doi.org/10.5281/zenodo.18308460}
+}
+```
+
+### Citations (data sources)
 
 Please cite the original data sources when using this pipeline:
 
 ```bibtex
 @article{chembl2024,
-  title={ChEMBL: towards direct deposition of bioassay data},
-  journal={Nucleic Acids Research},
-  year={2024}
+  title   = {ChEMBL: towards direct deposition of bioassay data},
+  journal = {Nucleic Acids Research},
+  year    = {2024}
 }
 
 @article{ctd2023,
-  title={The Comparative Toxicogenomics Database: update 2023},
-  journal={Nucleic Acids Research},
-  year={2023}
+  title   = {The Comparative Toxicogenomics Database: update 2023},
+  journal = {Nucleic Acids Research},
+  year    = {2023}
 }
 
 @article{drugcentral2023,
-  title={DrugCentral 2023 extends human clinical data and integrates veterinary drugs},
-  journal={Nucleic Acids Research},
-  year={2023}
+  title   = {DrugCentral 2023 extends human clinical data and integrates veterinary drugs},
+  journal = {Nucleic Acids Research},
+  year    = {2023}
 }
 
 @article{opentargets2023,
-  title={Open Targets Platform: supporting systematic drug-target identification and prioritisation},
-  journal={Nucleic Acids Research},
-  year={2023}
+  title   = {Open Targets Platform: supporting systematic drug-target identification and prioritisation},
+  journal = {Nucleic Acids Research},
+  year    = {2023}
 }
 
 @article{sider2016,
-  title={The SIDER database of drugs and side effects},
-  journal={Nucleic Acids Research},
-  year={2016}
+  title   = {The SIDER database of drugs and side effects},
+  journal = {Nucleic Acids Research},
+  year    = {2016}
 }
 ```
 
@@ -317,7 +427,13 @@ Please cite the original data sources when using this pipeline:
 ## Contact & Support
 
 For questions, issues, or contributions, please refer to the project repository or contact the research team.
-Muhammad Muneeb muneebsiddique007@gmail.com or m.muneeb@uq.edu.au
 
- 
- 
+**Muhammad Muneeb**
+
+* Email: [muneebsiddique007@gmail.com](mailto:muneebsiddique007@gmail.com)
+* Email: [m.muneeb@uq.edu.au](mailto:m.muneeb@uq.edu.au)
+* GitHub: [https://github.com/MuhammadMuneeb007/drug-disease-mapping](https://github.com/MuhammadMuneeb007/drug-disease-mapping)
+
+```
+::contentReference[oaicite:0]{index=0}
+```
