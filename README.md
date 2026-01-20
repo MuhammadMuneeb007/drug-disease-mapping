@@ -8,24 +8,7 @@ A comprehensive pipeline for downloading, processing, and merging drug-disease a
 - **DOI:** https://doi.org/10.5281/zenodo.18308460  
 - **Zenodo record:** https://zenodo.org/records/18308460  
 
----
-
-## Table of Contents
-
-- [Overview](#overview)
-- [Data Sources](#data-sources)
-- [Pipeline Architecture](#pipeline-architecture)
-- [File Structure](#file-structure)
-- [Data Processing Scripts](#data-processing-scripts)
-- [Output Files](#output-files)
-- [Merging Methodology](#merging-methodology)
-- [Usage](#usage)
-- [Requirements](#requirements)
-- [License & Citations](#license--citations)
-- [Contact & Support](#contact--support)
-
----
-
+ 
 ## Overview
 
 This pipeline systematically:
@@ -129,63 +112,10 @@ This pipeline systematically:
 └────────────────────────┘      └─────────────────────────┘
 
 ```
-
+ 
+ 
 ---
-
-## File Structure
-
-```
-
-AllDiseasesToDrugs/
-├─ DownloadAllDrugs/
-│  ├─ aact.py
-│  ├─ chembl.py
-│  ├─ ctd.py
-│  ├─ drugcentral.py
-│  ├─ opentargets.py
-│  ├─ sider.py
-│  └─ (downloaded raw source files / caches as applicable)
-├─ mergeDrugs.py
-├─ AllDiseasesToDrugs.py
-├─ README.md
-└─ output/
-├─ aact_drug_disease.csv
-├─ chembl.csv
-├─ ctd_drug_disease.csv
-├─ ctgov_drug_disease.csv
-├─ drugcentral_drug_disease.csv
-├─ opentargets_drug_disease.csv
-├─ sider_drug_indication.csv
-├─ ALL_SOURCES_drug_disease_merged.csv
-├─ ALL_SOURCES_drug_disease_deduplicated.csv
-└─ migraine_drugs.csv
-
-```
-
----
-
-## Data Processing Scripts
-
-### Downloaders (per-source)
-- `DownloadAllDrugs/aact.py` — downloads/derives trial intervention–condition mappings from AACT / ClinicalTrials.gov
-- `DownloadAllDrugs/chembl.py` — extracts drug–indication mappings and phase information from ChEMBL SQLite
-- `DownloadAllDrugs/ctd.py` — processes CTD chemical–disease associations (curated + inferred)
-- `DownloadAllDrugs/drugcentral.py` — queries DrugCentral (PostgreSQL-backed) for indications/contraindications
-- `DownloadAllDrugs/opentargets.py` — pulls Open Targets drug–disease associations (may use `chembl.csv` for name harmonization)
-- `DownloadAllDrugs/sider.py` — parses SIDER indications extracted from labels
-
-### Merging
-- `mergeDrugs.py` — standardizes, concatenates, annotates sources, and exports merged + deduplicated CSVs
-
-### Bulk pipeline runner
-- `AllDiseasesToDrugs.py` — end-to-end orchestration:
-  1. download all sources
-  2. normalize/standardize
-  3. generate unified SQLite (if configured)
-  4. export CSV/Parquet outputs
-
----
-
+ 
 ## Output Files
 
 ### Primary Outputs
@@ -218,38 +148,7 @@ Features:
 * Maintains first-occurrence source attribution
 
 ```
-
-### Source-Specific Files
-
-| File | Rows | Source Database |
-|------|------|-----------------|
-| `aact_drug_disease.csv` | 688,747 | AACT/ClinicalTrials.gov |
-| `chembl.csv` | 59,787 | ChEMBL |
-| `ctd_drug_disease.csv` | 3,564,540 | CTD |
-| `ctgov_drug_disease.csv` | 671,365 | ClinicalTrials.gov Direct |
-| `drugcentral_drug_disease.csv` | 38,431 | DrugCentral |
-| `opentargets_drug_disease.csv` | 65,198 | Open Targets |
-| `sider_drug_indication.csv` | 19,002 | SIDER |
-
-### Domain-Specific Subsets
-
-#### **migraine_drugs.csv** (5,049 rows)
-
-```
-
-Purpose:     Migraine-specific drug associations
-Schema:      drug_name, drug_id, n_migraine_rows, unique_disease_terms,
-sources, internal_sources
-Features:
-
-* Aggregates all migraine-related associations
-* Counts occurrences across sources
-* Lists all associated sources per drug
-
-```
-
----
-
+  
 ## Data Quality Metrics
 
 ```
@@ -264,81 +163,7 @@ Unique Diseases:            ~50,000
 Sources Per Drug (avg):     2.3
 
 ````
-
----
-
-## Merging Methodology
-
-1. **Standardize schemas**
-   - Normalize column names and types across sources
-   - Ensure presence of core fields (drug, disease, source provenance)
-
-2. **Normalize text**
-   - Lowercase drug/disease strings
-   - Strip whitespace / clean common formatting issues
-
-3. **Preserve provenance**
-   - Add `source` and `internal_source` annotations
-   - Store source-specific extra fields in `extra_metadata` (JSON) where applicable
-
-4. **Merge**
-   - Vertical concatenation of standardized tables (Polars)
-
-5. **Deduplicate**
-   - Collapse duplicates to unique `(drug_name, drug_id, disease)` (or equivalent harmonized key)
-   - Keep first-occurrence provenance fields for traceability
-
----
-
-## Usage
-
-### Running Individual Downloaders
-
-```bash
-# Download AACT data
-cd DownloadAllDrugs
-python aact.py --out aact_drug_disease.csv
-
-# Download ChEMBL data (requires chembl_XX_sqlite.tar.gz)
-python chembl.py /path/to/chembl_36_sqlite.tar.gz --out chembl.csv
-
-# Download CTD data
-python ctd.py --out ctd_drug_disease.csv
-
-# Download DrugCentral data (requires PostgreSQL connection)
-python drugcentral.py --out drugcentral_drug_disease.csv
-
-# Download Open Targets data (requires chembl.csv for drug names)
-python opentargets.py --chembl chembl.csv --out opentargets_drug_disease.csv
-
-# Download SIDER data
-python sider.py --out sider_drug_indication.csv
-````
-
-### Merging All Sources
-
-```bash
-# Ensure all source CSV files are in current directory
-python mergeDrugs.py
-
-# Output: ALL_SOURCES_drug_disease_deduplicated.csv
-```
-
-### Complete Pipeline (Bulk Download + Merge)
-
-```bash
-# Run full pipeline
-python AllDiseasesToDrugs.py ./output_directory
-
-# This will:
-# 1. Download all sources
-# 2. Process and normalize
-# 3. Create unified SQLite database
-# 4. Export CSV and Parquet files
-```
-
----
-
+  
 ## Requirements
 
 ### Python Dependencies
