@@ -1,4 +1,4 @@
-```markdown
+ 
 # Drug-Disease Association Data Pipeline
 
 A comprehensive pipeline for downloading, processing, and merging drug-disease associations from multiple public biomedical databases. This repository integrates data from 7 major sources to create a unified drug-disease association dataset for pharmaceutical research and computational biology applications.
@@ -436,4 +436,4 @@ For questions, issues, or contributions, please refer to the project repository 
 
 ```
 ::contentReference[oaicite:0]{index=0}
-```
+ 
