@@ -260,5 +260,5 @@ For questions, issues, or contributions, please refer to the project repository 
 * GitHub: [https://github.com/MuhammadMuneeb007/drug-disease-mapping](https://github.com/MuhammadMuneeb007/drug-disease-mapping)
 
 ```
-::contentReference[oaicite:0]{index=0}
+ 
  
