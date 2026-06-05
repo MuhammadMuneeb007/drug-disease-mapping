@@ -1,6 +1,4 @@
-Yes — you should update it. Your old README says **7 sources** and old row counts, but the current pipeline has **11 included sources**, updated analysis scripts, Zenodo data, and the overlap heatmap. Below is a complete drop-in `README.md`.
-
-````markdown
+ 
 # Drug–Disease Association Data Pipeline
 
 A reproducible, source-aware pipeline for downloading, processing, harmonising, merging, and deduplicating drug–disease relationships from public biomedical resources.
@@ -433,5 +431,4 @@ Please cite the original sources where relevant.
 * GitHub: [https://github.com/MuhammadMuneeb007](https://github.com/MuhammadMuneeb007)
 * Repository: [https://github.com/MuhammadMuneeb007/drug-disease-mapping](https://github.com/MuhammadMuneeb007/drug-disease-mapping)
 
-```
-```
+ 
