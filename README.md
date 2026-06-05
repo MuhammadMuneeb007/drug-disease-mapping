@@ -8,6 +8,23 @@ This repository was created to build an analysis-ready drug–disease relationsh
 ![Pairwise drug–disease pair overlap heatmap](pairwise_drug_disease_pair_overlap_heatmap.png)
 
 ---
+## Licence
+
+The source code in this repository is released under the **MIT Licence**.
+
+This licence applies only to the pipeline code, analysis scripts, documentation, and repository materials created for this project. The integrated drug–disease dataset is derived from multiple third-party public biomedical databases, and each original data source retains its own licence, terms of use, attribution requirements, and redistribution conditions.
+
+Users must therefore follow the licence and reuse terms of each original database when using, redistributing, or building upon the processed dataset. In particular, some sources may have non-commercial, attribution, share-alike, or redistribution-sensitive conditions.
+
+In summary:
+
+- **Pipeline code:** MIT Licence.
+- **Processed integrated dataset:** Use according to the licence and reuse terms of the original source databases.
+- **Third-party source data:** Remain governed by their respective database licences and terms of use.
+- **Citation:** Users should cite this Zenodo dataset and the original databases used in their analysis.
+
+This repository does not override or replace the licence terms of AACT / ClinicalTrials.gov, ChEMBL, CTD, DrugCentral, Open Targets, SIDER, Hetionet, MEDI, PrimeKG, Broad Drug Repurposing Hub, repoDB, or any other upstream data source.
+
 
 ## Data availability
 
