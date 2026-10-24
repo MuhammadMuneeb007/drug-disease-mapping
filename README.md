@@ -6,7 +6,7 @@ A reproducible, source-aware workflow for extracting, harmonising, integrating, 
 
 **Manuscript:** *A source-aware drug–disease relationship dataset integrating public biomedical resources* — Muhammad Muneeb and David B. Ascher.
 
-> **Release status (October 2026).** The numbers below describe the **validated 11-source Version 2 analysis**, not necessarily the files currently deposited on Zenodo. The [existing project Zenodo record](https://doi.org/10.5281/zenodo.18308460) is an earlier project record. The matching Version 2 deposit, final DOI, archive checksums, and immutable code tag must be confirmed before calling this a completed release. Source-specific redistribution clearance also remains under review.
+> **Published dataset (24 October 2026):** The validated eleven-source dataset is publicly available as **[Zenodo v3 (DOI: 10.5281/zenodo.23627171)](https://doi.org/10.5281/zenodo.23627171)**. The archive contains **14 files**, including the event, assertion and strict-identity pair datasets, integration and QC manifests, data dictionaries, source/licensing documentation, selected supplementary outputs, and SHA-256 checksums. The [concept DOI](https://doi.org/10.5281/zenodo.18308459) links all versions. This is the published **Zenodo v3** record for the internally validated eleven-source integration; a final tagged code release is not yet asserted. **Third-party data redistribution and CC BY 4.0 compatibility remain subject to rights review.**
 
 ## Contents
 
@@ -60,6 +60,12 @@ These statistics are from the locked manuscript-analysis inputs processed and au
 | **Total** | **10,895,395** | **4,534,385** | **6,361,010** |
 
 CTD's large reduction from evidence events to assertions mainly reflects multiple inferred-gene and publication-associated events underlying the same chemical–disease assertion. AACT similarly retains distinct trial-level contexts. The source-event ledger, rather than the assertion layer, should be used when those contexts are needed.
+
+### Pairwise drug–disease pair overlap heatmap
+
+![Pairwise overlap of conservatively normalised drug–disease name pairs among the eleven biomedical resources](pairwise_drug_disease_pair_overlap_heatmap.png)
+
+*Pairwise drug–disease name-pair overlap across the eleven included databases.* The graphic summarises shared conservatively normalised drug–disease name pairs and pairwise Jaccard similarity. Lexical overlap does **not** establish ontology-level equivalence, independent evidence, or validated therapeutic efficacy. The [PNG figure](pairwise_drug_disease_pair_overlap_heatmap.png) is stored in the repository root; its generation code is [`Analysis_09_Cross_source_drug_disease_pair_ovelap_diagram.py`](Analysis_09_Cross_source_drug_disease_pair_ovelap_diagram.py). For reproducibility, consult the analysis scripts and deposited dataset version.
 
 ## Sources and versions
 
@@ -249,15 +255,7 @@ python Analysis_23_WHO_EML_or_Approved_Drug_Coverage.py --save-tables
 
 ### 6. Review figures and tables
 
-The analysis scripts optionally write summary CSVs into `tables/` and the heatmap generator writes outputs into `figures/`. Its principal names are:
-
-```text
-figures/pairwise_drug_disease_pair_overlap_heatmap.png
-figures/pairwise_drug_disease_pair_overlap_heatmap.pdf
-tables/pairwise_drug_disease_pair_overlap_heatmap.csv
-```
-
-Off-diagonal heatmap entries are **shared conservatively normalised drug–disease name-pair counts and pairwise Jaccard similarity**, not conditional row-overlap percentages. Before publishing figures, confirm they were regenerated from the same locked event/assertion snapshot, and commit the final matching figure assets separately if absent from GitHub.
+The **[committed heatmap PNG](pairwise_drug_disease_pair_overlap_heatmap.png)** is available at the repository root and is displayed above. The figure-generation script can also write plots under `figures/` and supporting tables under `tables/` when run locally; these generated directories are not necessarily committed to GitHub. The heatmap expresses **shared conservatively normalised drug–disease name-pair counts and pairwise Jaccard similarity**, not conditional row-overlap percentages. Reproduction should use the matching validated snapshot and documented scripts.
 
 ## Analysis scripts
 
@@ -317,19 +315,21 @@ The following table reports the licensing statements and concerns documented in 
 | repoDB | **CC BY 4.0** reported | Attribution; review embedded DrugBank/UMLS and trial-derived rights |
 | SIDER | **CC BY-SA 4.0** reported for indication data | Attribution, ShareAlike and underlying terminology rights |
 
-**Required before final Version 2 deposit:** finalise the source/licence matrix; preserve source-specific acknowledgements and attribution; obtain institutional rights review or source-owner permission when terms are ambiguous or incompatible; and, if needed, split, omit, or distribute restricted components through an authorised mechanism. **The MIT software licence must not be represented as licensing the entire integrated dataset.**
+**Rights review for the published Zenodo v3 dataset:** The public Zenodo record displays **CC BY 4.0**, but the eleven contributing sources have potentially incompatible conditions, including non-commercial and share-alike terms. The release documentation reports these terms; it does **not** establish blanket redistribution clearance. Preserve source attribution, obtain institutional/source-owner guidance, and if required correct access, licence metadata, or the released content using an authorised approach. **The MIT software licence applies to project-created code only.**
 
 ## Data availability and release provenance
 
-- **Project code:** [GitHub](https://github.com/MuhammadMuneeb007/drug-disease-mapping)
-- **Existing project data record:** [Zenodo DOI 10.5281/zenodo.18308460](https://doi.org/10.5281/zenodo.18308460)
-- **Validated 11-source Version 2 DOI:** **to be inserted after deposit and verification**
-- **Version 2 code release/tag:** **to be recorded after code and working tree are frozen**
-- **Version 2 file inventory / published archive SHA-256:** **to be inserted after verification**
+- **Published validated dataset (Zenodo v3, 24 October 2026):** [DOI 10.5281/zenodo.23627171](https://doi.org/10.5281/zenodo.23627171)
+- **All versions (concept DOI):** [10.5281/zenodo.18308459](https://doi.org/10.5281/zenodo.18308459)
+- **Earlier versions:** [v1](https://doi.org/10.5281/zenodo.18308460) and [v2](https://doi.org/10.5281/zenodo.20569217)
+- **Code:** [GitHub repository](https://github.com/MuhammadMuneeb007/drug-disease-mapping)
+- **Frozen code tag / archived code DOI:** Not yet established in this README; do not substitute an audit-time checkout for a verified release tag.
 
-The source audit records an extraction/integration time and checksums, including the 24 October 2026 DrugCentral snapshot, but a source file's modification time is **not proof of its download date**. The audit checkout hash is **not automatically the final release hash**. A reproducible deposition should record the exact Git commit, Polars and Python versions, source version identifiers, input/output checksums, scripts and execution arguments, included sources, and any unresolved licensing restrictions.
+The **14 deposited files** comprise three compressed CSV datasets (`ALL_INCLUDED_SOURCES_drug_disease_merged.csv.gz`, `ALL_INCLUDED_SOURCES_drug_disease_deduplicated.csv.gz`, and `ALL_INCLUDED_SOURCES_drug_disease_source_collapsed.csv.gz`) plus `ALL_INCLUDED_SOURCES_merge_summary.json`, `Analysis_00C_merge_quality_report.json`, `data_dictionary.csv`, `data_dictionary.md`, `data_dictionary_summary.json`, `source_manifest.csv`, `LICENSES_AND_REUSE.md`, `README_DATA_RELEASE.txt`, `release_manifest.json`, `checksums_sha256.txt`, and `supplementary_analysis_outputs.zip`.
 
-The validated outputs are large; **do not commit raw database archives or multi-gigabyte integrated CSVs to the Git repository**. Deposit authorised data with checksums to a suitable data repository and link the matching version here. The current Version 2 statistics must not be attributed to an older archive until that archive is confirmed to contain exactly the same records.
+These counts describe the validated eleven-source integration deposited as **Zenodo v3**. Use the `release_manifest.json` and `checksums_sha256.txt` in that record to check downloaded files. This repository contains code, documentation, and the heatmap preview; the multi-gigabyte integrated datasets belong in Zenodo rather than Git. Source-file modification timestamps are not proof of download dates, and recorded audit commits are not automatically an immutable code release.
+
+**Licensing note:** The dataset record is public and lists CC BY 4.0, but third-party terms may limit redistribution of derived records; see the licence section above and the deposited `LICENSES_AND_REUSE.md`. A disclaimer by itself does not resolve licence compatibility.
 
 ## Citation and acknowledgements
 
@@ -339,16 +339,17 @@ The manuscript is authored by **Muhammad Muneeb and David B. Ascher**:
 
 > Muneeb, M. & Ascher, D. B. *A source-aware drug–disease relationship dataset integrating public biomedical resources*. Manuscript in preparation (2026). **Update with journal/DOI after publication.**
 
-For dataset use, cite the **specific Zenodo version actually used**. The existing project record is:
+For dataset use, cite the **specific published version actually used**. The validated eleven-source dataset is **Zenodo v3**:
 
 ```bibtex
-@dataset{muneeb_drug_disease_2026,
+@dataset{muneeb_drug_disease_v3_2026,
   author    = {Muneeb, Muhammad},
-  title     = {Drug-Disease Association Data Pipeline and Unified Dataset},
+  title     = {A source-aware drug--disease relationship dataset integrating public biomedical resources},
   year      = {2026},
+  version   = {v3},
   publisher = {Zenodo},
-  doi       = {10.5281/zenodo.18308460},
-  url       = {https://doi.org/10.5281/zenodo.18308460}
+  doi       = {10.5281/zenodo.23627171},
+  url       = {https://doi.org/10.5281/zenodo.23627171}
 }
 ```
 
