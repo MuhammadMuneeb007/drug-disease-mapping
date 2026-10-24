@@ -1,826 +1,986 @@
+
 #!/usr/bin/env python3
+"""Polars streaming merger, 11 manuscript sources only.
+
+Dependencies: pip install -U polars tqdm
+Run: python mergedanalysis.py --recount-merged | tee mergedanalysis.log
+
+Full events are never deduplicated. Assertion and exact-identity pair
+summaries link to events using two-seed Polars hash IDs, which are
+version-dependent; the manifest records the Polars version. No ontology
+crosswalk, regulatory adjudication, or independent-evidence claim is made.
 """
-Merge locked/included drug-disease association sources into one unified dataset.
-
-Included sources
-----------------
-1. AACT / ClinicalTrials.gov
-2. Broad Drug Repurposing Hub
-3. ChEMBL
-4. CTD
-5. DrugCentral
-6. Hetionet
-7. MEDI-2
-8. Open Targets
-9. PrimeKG
-10. repoDB
-11. SIDER
-
-Excluded sources
-----------------
-openFDA:
-    Excluded because the current openFDA script is only an inspection script
-    and does not extract final drug-disease mappings.
-
-TTD:
-    Excluded because the current TTD run produced zero rows due to invalid/
-    blocked 461-byte raw input files. Do not include until the source is fixed
-    and produces validated non-empty output.
-
-Outputs
--------
-data/processed/ALL_INCLUDED_SOURCES_drug_disease_merged.csv
-data/processed/ALL_INCLUDED_SOURCES_drug_disease_deduplicated.csv
-data/processed/ALL_INCLUDED_SOURCES_drug_disease_source_collapsed.csv
-data/processed/ALL_INCLUDED_SOURCES_merge_summary.json
-
-Run
----
-python mergedanalysis.py
-
-Requirements
-------------
-pip install polars
-"""
-
 from __future__ import annotations
 
+import argparse
+import csv
 import hashlib
 import json
+import os
+import shutil
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 import polars as pl
+from tqdm import tqdm
 
-
-# =============================================================================
-# CONFIG
-# =============================================================================
-
-BASE = Path(
-    "/data/ascher02/uqmmune1/ANNOVAR/drug_disease_data/"
-    "drug-disease-mapping/data/processed"
-)
-
-OUTPUT_MERGED = BASE / "ALL_INCLUDED_SOURCES_drug_disease_merged.csv"
-OUTPUT_DEDUP = BASE / "ALL_INCLUDED_SOURCES_drug_disease_deduplicated.csv"
-OUTPUT_COLLAPSED = BASE / "ALL_INCLUDED_SOURCES_drug_disease_source_collapsed.csv"
-OUTPUT_SUMMARY = BASE / "ALL_INCLUDED_SOURCES_merge_summary.json"
-
-
-UNIFIED_COLS = [
-    "drug_name",
-    "drug_identifier",
-    "drug_identifier_type",
-    "disease_or_condition_name",
-    "disease_or_condition_identifier",
-    "disease_or_condition_identifier_type",
-    "relationship_type",
-    "evidence_type",
-    "source",
-    "internal_source",
+CORE = [
+    "drug_name", "drug_identifier", "drug_identifier_type",
+    "disease_or_condition_name", "disease_or_condition_identifier",
+    "disease_or_condition_identifier_type", "relationship_type",
+    "evidence_type", "source", "internal_source",
 ]
-
-
-# =============================================================================
-# INCLUDED SOURCES ONLY
-# =============================================================================
+IDENTITY = CORE[:6]
+ASSERTION = CORE[:9]
+MISSING = ["", "NA", "N/A", "NAN", "NULL", "NONE"]
 
 SOURCES = [
-    {
-        "source": "AACT",
-        "internal_source": "ClinicalTrials.gov via AACT",
-        "candidates": [
-            "aact/aact_drug_disease.csv",
-            "aact_drug_disease.csv",
-        ],
-    },
-    {
-        "source": "Broad Drug Repurposing Hub",
-        "internal_source": "Broad Repurposing Hub drug annotation file",
-        "candidates": [
-            "broad_repurposing/broad_repurposing_drug_disease.csv",
-            "broad_repurposing_drug_disease.csv",
-        ],
-    },
-    {
-        "source": "ChEMBL",
-        "internal_source": "ChEMBL drug_indication",
-        "candidates": [
-            "chembl/chembl_drug_disease.csv",
-            "chembl_drug_disease.csv",
-            "chembl.csv",
-        ],
-    },
-    {
-        "source": "CTD",
-        "internal_source": "CTD chemicals-diseases aggregate",
-        "candidates": [
-            "ctd/ctd_aggregate_chemical_disease.csv",
-            "ctd_aggregate_chemical_disease.csv",
-            "ctd_drug_disease.csv",
-        ],
-    },
-    {
-        "source": "DrugCentral",
-        "internal_source": "DrugCentral clinical drug-condition relationships",
-        "candidates": [
-            "drugcentral/drugcentral_drug_disease.csv",
-            "drugcentral_drug_disease.csv",
-        ],
-    },
-    {
-        "source": "Hetionet",
-        "internal_source": "Hetionet v1.0",
-        "candidates": [
-            "hetionet/hetionet_drug_disease.csv",
-            "hetionet_drug_disease.csv",
-        ],
-    },
-    {
-        "source": "MEDI",
-        "internal_source": "MEDI-2",
-        "candidates": [
-            "medi/medi_drug_disease.csv",
-            "medi_drug_disease.csv",
-        ],
-    },
-    {
-        "source": "OpenTargets",
-        "internal_source": "Open Targets clinical_indication",
-        "candidates": [
-            "opentargets/opentargets_drug_disease.csv",
-            "opentargets_drug_disease.csv",
-        ],
-    },
-    {
-        "source": "PrimeKG",
-        "internal_source": "PrimeKG v2.1",
-        "candidates": [
-            "primekg/primekg_drug_disease.csv",
-            "primekg_drug_disease.csv",
-        ],
-    },
-    {
-        "source": "repoDB",
-        "internal_source": "repoDB full database",
-        "candidates": [
-            "repodb/repodb_drug_disease.csv",
-            "repodb_drug_disease.csv",
-        ],
-    },
-    {
-        "source": "SIDER",
-        "internal_source": "SIDER 4.1",
-        "candidates": [
-            "sider/sider_drug_disease.csv",
-            "sider_drug_disease.csv",
-            "sider/sider_drug_indication.csv",
-            "sider_drug_indication.csv",
-        ],
-    },
+    ("AACT", "aact/aact_drug_disease.csv", 688745),
+    (
+        "Broad Drug Repurposing Hub",
+        "broad_repurposing/broad_repurposing_drug_disease.csv",
+        3892,
+    ),
+    ("ChEMBL", "chembl_drug_disease.csv", 60055),
+    ("CTD", "ctd_aggregate_chemical_disease.csv", 9735698),
+    ("DrugCentral", "drugcentral_drug_disease.csv", 42515),
+    ("Hetionet", "hetionet/hetionet_drug_disease.csv", 1145),
+    ("MEDI", "medi/medi_drug_disease.csv", 222412),
+    ("OpenTargets", "opentargets_drug_disease.csv", 53950),
+    ("PrimeKG", "primekg/primekg_drug_disease.csv", 42631),
+    ("repoDB", "repodb/repodb_drug_disease.csv", 13558),
+    ("SIDER", "sider/sider_drug_disease.csv", 30794),
+]
+
+FILENAMES = {
+    "merged": "ALL_INCLUDED_SOURCES_drug_disease_merged.csv",
+    "dedup": "ALL_INCLUDED_SOURCES_drug_disease_deduplicated.csv",
+    "pairs": "ALL_INCLUDED_SOURCES_drug_disease_source_collapsed.csv",
+    "summary": "ALL_INCLUDED_SOURCES_merge_summary.json",
+}
+
+ADDED = [
+    "merge_event_id",
+    "merge_assertion_id",
+    "merge_pair_id",
+    "merge_source_row_number",
+    "merge_input_file",
+    "merge_original_source",
+    "merge_original_internal_source",
+    "merge_original_drug_name",
+    "merge_original_disease_name",
+    "merge_drug_name_status",
+    "merge_disease_name_status",
+    "merge_evidence_family",
+    "merge_bucket",
 ]
 
 
-# =============================================================================
-# COLUMN MAPPING
-# =============================================================================
-
-COLUMN_ALIASES = {
-    "drug_name": [
-        "drug_name",
-        "chemical_name",
-        "compound_name",
-        "pert_iname",
-        "intervention_name",
-        "drug",
-        "name",
-    ],
-    "drug_identifier": [
-        "drug_identifier",
-        "drug_id",
-        "chemical_id",
-        "compound_id",
-        "molecule_chembl_id",
-        "chembl_id",
-        "rxcui",
-        "RXCUI",
-        "stitch_id",
-    ],
-    "drug_identifier_type": [
-        "drug_identifier_type",
-        "chemical_identifier_type",
-        "drug_id_type",
-    ],
-    "disease_or_condition_name": [
-        "disease_or_condition_name",
-        "disease_name",
-        "condition_name",
-        "indication_name",
-        "ind_name",
-        "disease",
-        "condition",
-    ],
-    "disease_or_condition_identifier": [
-        "disease_or_condition_identifier",
-        "disease_identifier",
-        "disease_id",
-        "condition_id",
-        "ind_id",
-        "mesh_id",
-        "meddra_id",
-    ],
-    "disease_or_condition_identifier_type": [
-        "disease_or_condition_identifier_type",
-        "disease_identifier_type",
-        "condition_identifier_type",
-    ],
-    "relationship_type": [
-        "relationship_type",
-        "relationship",
-        "relation",
-    ],
-    "evidence_type": [
-        "evidence_type",
-        "evidence",
-        "direct_evidence",
-    ],
-    "source": [
-        "source",
-    ],
-    "internal_source": [
-        "internal_source",
-    ],
-}
-
-
-DEFAULT_RELATIONSHIP = "drug_disease_association"
-DEFAULT_EVIDENCE = "source_specific_drug_disease_evidence"
-
-
-# =============================================================================
-# HELPERS
-# =============================================================================
-
-def now_utc() -> str:
+def now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def print_section(title: str) -> None:
-    print("\n" + "=" * 100)
-    print(title)
-    print("=" * 100)
-
-
-def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+def digest(path):
     h = hashlib.sha256()
-
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(chunk_size), b""):
-            h.update(chunk)
-
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(8 * 1024 * 1024), b""):
+            h.update(block)
     return h.hexdigest()
 
 
-def human_size(num_bytes: int) -> str:
-    size = float(num_bytes)
+def csv_header(path):
+    if not path.is_file() or not path.stat().st_size:
+        raise RuntimeError(f"Missing manuscript input: {path}")
 
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if size < 1024:
-            return f"{size:.2f} {unit}"
-        size /= 1024
+    with path.open(
+        "r", encoding="utf-8-sig", newline=""
+    ) as f:
+        head = next(csv.reader(f, strict=True), None)
 
-    return f"{size:.2f} PB"
-
-
-def find_existing_file(candidates: list[str]) -> Path | None:
-    for rel in candidates:
-        path = BASE / rel
-
-        if path.exists() and path.stat().st_size > 0:
-            return path
-
-    return None
-
-
-def read_csv_safely(path: Path) -> pl.DataFrame | None:
-    if not path.exists():
-        return None
-
-    if path.stat().st_size == 0:
-        print(f"[SKIP] Empty file: {path}")
-        return None
-
-    try:
-        df = pl.read_csv(
-            path,
-            infer_schema_length=10000,
-            ignore_errors=True,
-            null_values=[
-                "",
-                "NA",
-                "N/A",
-                "nan",
-                "NaN",
-                "None",
-                "NULL",
-                "null",
-            ],
+    if (
+        not head
+        or len(head) != len(set(head))
+        or head[:10] != CORE
+    ):
+        raise RuntimeError(
+            f"Nonconforming 10-column core "
+            f"or duplicate header: {path}: {head}"
         )
 
-    except pl.exceptions.NoDataError:
-        print(f"[SKIP] No data in file: {path}")
-        return None
+    if set(head).intersection(ADDED):
+        raise RuntimeError(
+            f"Reserved merge column in {path}"
+        )
 
-    except Exception as e:
-        print(f"[SKIP] Could not read file: {path}")
-        print(f"       Reason: {type(e).__name__}: {e}")
-        return None
-
-    if df.height == 0:
-        print(f"[SKIP] Header-only or zero-row file: {path}")
-        return None
-
-    return df
+    return head
 
 
-def get_first_existing_col(df: pl.DataFrame, candidates: list[str]) -> pl.Expr:
-    for col in candidates:
-        if col in df.columns:
-            return pl.col(col).cast(pl.Utf8)
-
-    return pl.lit("", dtype=pl.Utf8)
-
-
-def normalise_text_expr(col_name: str) -> pl.Expr:
+def blank(column):
     return (
-        pl.col(col_name)
-        .cast(pl.Utf8)
+        pl.col(column)
         .fill_null("")
         .str.strip_chars()
-        .str.replace_all(r"\s+", " ")
-        .alias(col_name)
+        .str.to_uppercase()
+        .is_in(MISSING)
     )
 
 
-def add_missing_unified_columns(
-    df: pl.DataFrame,
-    source: str,
-    internal_source: str,
-) -> pl.DataFrame:
-    """
-    Map source-specific columns into the unified schema.
+def normalise_evidence(source, columns):
+    """Source-aware interpretation, not independent approval."""
 
-    Important:
-    ----------
-    The top-level source and internal_source columns are intentionally forced
-    from the controlled SOURCES configuration.
+    r = pl.col("relationship_type").str.to_lowercase()
+    e = pl.col("evidence_type").str.to_lowercase()
 
-    This prevents problems such as SIDER being counted as SIDER4.1 instead of
-    SIDER in source-level summaries.
-
-    The original input source labels are still preserved in merge metadata
-    columns added later.
-    """
-    expressions = []
-
-    for out_col in UNIFIED_COLS:
-        # Controlled source names must always be forced.
-        if out_col == "source":
-            expr = pl.lit(source, dtype=pl.Utf8).alias(out_col)
-
-        elif out_col == "internal_source":
-            expr = pl.lit(internal_source, dtype=pl.Utf8).alias(out_col)
-
-        elif out_col == "relationship_type":
-            raw_expr = get_first_existing_col(
-                df,
-                COLUMN_ALIASES.get(out_col, [out_col]),
-            )
-
-            expr = (
-                pl.when(raw_expr.is_null() | (raw_expr.str.strip_chars() == ""))
-                .then(pl.lit(DEFAULT_RELATIONSHIP))
-                .otherwise(raw_expr)
-                .alias(out_col)
-            )
-
-        elif out_col == "evidence_type":
-            raw_expr = get_first_existing_col(
-                df,
-                COLUMN_ALIASES.get(out_col, [out_col]),
-            )
-
-            expr = (
-                pl.when(raw_expr.is_null() | (raw_expr.str.strip_chars() == ""))
-                .then(pl.lit(DEFAULT_EVIDENCE))
-                .otherwise(raw_expr)
-                .alias(out_col)
-            )
-
-        else:
-            expr = get_first_existing_col(
-                df,
-                COLUMN_ALIASES.get(out_col, [out_col]),
-            ).alias(out_col)
-
-        expressions.append(expr)
-
-    return df.with_columns(expressions)
-
-
-def clean_text_columns(df: pl.DataFrame) -> pl.DataFrame:
-    return df.with_columns([normalise_text_expr(c) for c in df.columns])
-
-
-def attach_source_metadata(
-    df: pl.DataFrame,
-    source: str,
-    internal_source: str,
-    file_path: Path,
-) -> pl.DataFrame:
-    """
-    Preserve merge-level provenance.
-
-    These columns make it clear which controlled source label was used,
-    which file was loaded, and where the row came from.
-    """
-    return df.with_columns(
-        [
-            pl.lit(source, dtype=pl.Utf8).alias("merge_source_label"),
-            pl.lit(internal_source, dtype=pl.Utf8).alias("merge_internal_source_label"),
-            pl.lit(str(file_path), dtype=pl.Utf8).alias("merge_input_file"),
-            pl.lit(file_path.name, dtype=pl.Utf8).alias("merge_input_filename"),
-        ]
-    )
-
-
-def load_one_source(source_cfg: dict[str, Any]) -> tuple[pl.DataFrame | None, dict[str, Any]]:
-    source = source_cfg["source"]
-    internal_source = source_cfg["internal_source"]
-    candidates = source_cfg["candidates"]
-
-    source_report = {
-        "source": source,
-        "internal_source": internal_source,
-        "candidate_paths": candidates,
-        "selected_file": None,
-        "status": "not_loaded",
-        "rows_original": 0,
-        "rows_after_core_filter": 0,
-        "columns_original": [],
-        "file_size_bytes": 0,
-        "file_sha256": "",
-        "reason": "",
-    }
-
-    file_path = find_existing_file(candidates)
-
-    if file_path is None:
-        source_report["status"] = "skipped"
-        source_report["reason"] = "No candidate file found."
-        print(f"[SKIP] {source}: no candidate file found.")
-        return None, source_report
-
-    source_report["selected_file"] = str(file_path)
-    source_report["file_size_bytes"] = int(file_path.stat().st_size)
-    source_report["file_sha256"] = sha256_file(file_path)
-
-    df = read_csv_safely(file_path)
-
-    if df is None:
-        source_report["status"] = "skipped"
-        source_report["reason"] = "File unreadable, empty, or header-only."
-        return None, source_report
-
-    source_report["rows_original"] = int(df.height)
-    source_report["columns_original"] = list(df.columns)
-
-    df = add_missing_unified_columns(
-        df=df,
-        source=source,
-        internal_source=internal_source,
-    )
-
-    df = attach_source_metadata(
-        df=df,
-        source=source,
-        internal_source=internal_source,
-        file_path=file_path,
-    )
-
-    df = clean_text_columns(df)
-
-    before = df.height
-
-    df = df.filter(
-        (pl.col("drug_name").is_not_null())
-        & (pl.col("drug_name") != "")
-        & (pl.col("disease_or_condition_name").is_not_null())
-        & (pl.col("disease_or_condition_name") != "")
-    )
-
-    after = df.height
-
-    source_report["rows_after_core_filter"] = int(after)
-
-    if after == 0:
-        source_report["status"] = "skipped"
-        source_report["reason"] = (
-            f"All {before:,} rows dropped because drug_name or "
-            "disease_or_condition_name was missing."
+    if "clinical_stage_is_explicit_approval" in columns:
+        stage = (
+            pl.col("clinical_stage_is_explicit_approval")
+            .fill_null("")
+            .str.to_lowercase() == "true"
         )
-        print(f"[SKIP] {source}: no valid rows after core filter.")
-        return None, source_report
+    else:
+        stage = pl.lit(False)
 
-    source_report["status"] = "loaded"
+    return (
+        pl.when(r == "contraindication")
+        .then(pl.lit("contraindication"))
 
-    print(
-        f"[LOAD] {source}: {after:,} rows "
-        f"from {file_path} "
-        f"({human_size(file_path.stat().st_size)})"
+        .when(r == "discontinued_development")
+        .then(pl.lit("halted_development"))
+
+        .when(source == "AACT")
+        .then(pl.lit("trial_cooccurrence"))
+
+        .when(source == "CTD")
+        .then(
+            pl.when(r == "ctd_direct_therapeutic")
+            .then(pl.lit("ctd_direct_therapeutic"))
+            .when(r.str.contains("marker|mechanism"))
+            .then(pl.lit("ctd_marker_mechanism"))
+            .otherwise(pl.lit("ctd_inferred_or_other"))
+        )
+
+        .when(source == "SIDER")
+        .then(
+            pl.when(r == "label_nlp_indication")
+            .then(pl.lit("label_nlp_indication"))
+            .when(r == "label_precondition")
+            .then(pl.lit("label_precondition"))
+            .otherwise(
+                pl.lit("label_text_mention_or_other")
+            )
+        )
+
+        .when(
+            (source == "repoDB")
+            & (e == "repodb_approved_indication")
+        )
+        .then(pl.lit("source_reported_approval"))
+
+        .when(
+            (source == "OpenTargets") & stage
+        )
+        .then(pl.lit("source_reported_approval"))
+
+        .when(r == "off_label_use")
+        .then(pl.lit("off_label_use"))
+
+        .when(r == "compound_palliates_disease")
+        .then(pl.lit("palliative_relation"))
+
+        .when(
+            r.is_in([
+                "indication",
+                "drug_indication",
+                "clinical_indication",
+                "compound_treats_disease",
+            ])
+        )
+        .then(pl.lit("source_reported_indication"))
+
+        .otherwise(pl.lit("other_or_unclassified"))
+        .alias("merge_evidence_family")
     )
 
-    return df, source_report
 
+def hashed_id(cols, prefix):
+    """Version-pinned Polars hash IDs; not ontology crosswalks."""
 
-def count_by_column(df: pl.DataFrame, column: str) -> dict[str, int]:
-    if df.height == 0 or column not in df.columns:
-        return {}
+    x = pl.struct([pl.col(c) for c in cols])
 
-    counts = (
-        df.group_by(column)
-        .len()
-        .sort("len", descending=True)
+    return pl.concat_str(
+        [
+            pl.lit(prefix),
+            x.hash(seed=12345).cast(pl.String),
+            pl.lit("_"),
+            x.hash(seed=90817).cast(pl.String),
+        ],
+        separator="",
     )
 
-    return {
-        str(row[column]): int(row["len"])
-        for row in counts.to_dicts()
-    }
+
+def make_source_lf(name, number, rel, path, header, buckets):
+    lf = pl.scan_csv(
+        path,
+        infer_schema=False,
+        row_index_name="_source_row_zero",
+        ignore_errors=False,
+        truncate_ragged_lines=False,
+        encoding="utf8",
+    )
+
+    lf = lf.with_columns([
+        pl.col(c).fill_null("")
+        for c in header
+    ])
+
+    lf = lf.with_columns([
+        pl.col("source").alias("merge_original_source"),
+        pl.col("internal_source").alias(
+            "merge_original_internal_source"
+        ),
+        pl.col("drug_name").alias(
+            "merge_original_drug_name"
+        ),
+        pl.col("disease_or_condition_name").alias(
+            "merge_original_disease_name"
+        ),
+    ])
+
+    lf = lf.with_columns([
+        pl.col(c).str.strip_chars().alias(c)
+        for c in CORE
+    ])
+
+    lf = lf.with_columns([
+        pl.when(
+            blank("drug_name")
+            & ~blank("drug_identifier")
+        )
+        .then(pl.col("drug_identifier"))
+        .otherwise(pl.col("drug_name"))
+        .alias("drug_name"),
+
+        pl.when(
+            blank("disease_or_condition_name")
+            & ~blank("disease_or_condition_identifier")
+        )
+        .then(pl.col("disease_or_condition_identifier"))
+        .otherwise(pl.col("disease_or_condition_name"))
+        .alias("disease_or_condition_name"),
+
+        pl.when(blank("drug_name"))
+        .then(pl.lit(
+            "identifier_placeholder_or_unresolved"
+        ))
+        .otherwise(pl.lit("source_name"))
+        .alias("merge_drug_name_status"),
+
+        pl.when(blank("disease_or_condition_name"))
+        .then(pl.lit(
+            "identifier_placeholder_or_unresolved"
+        ))
+        .otherwise(pl.lit("source_name"))
+        .alias("merge_disease_name_status"),
+
+        pl.lit(name).alias("source"),
+        pl.lit(rel).alias("merge_input_file"),
+
+        (pl.col("_source_row_zero") + 1)
+        .alias("_source_row_one"),
+    ])
+
+    lf = lf.with_columns([
+        pl.concat_str([
+            pl.lit(f"{number:02d}:"),
+            pl.col("_source_row_one").cast(pl.String),
+        ]).alias("merge_event_id"),
+
+        pl.col("_source_row_one")
+        .cast(pl.String)
+        .alias("merge_source_row_number"),
+
+        normalise_evidence(name, header),
+    ])
+
+    lf = lf.with_columns([
+        hashed_id(IDENTITY, "P").alias(
+            "merge_pair_id"
+        ),
+
+        hashed_id(ASSERTION, "A").alias(
+            "merge_assertion_id"
+        ),
+
+        (
+            pl.struct([
+                pl.col(c) for c in IDENTITY
+            ]).hash(seed=771) % buckets
+        )
+        .cast(pl.Int32)
+        .alias("merge_bucket"),
+    ])
+
+    return lf.drop(
+        "_source_row_zero",
+        "_source_row_one",
+    )
 
 
-def collapse_sources(df: pl.DataFrame) -> pl.DataFrame:
-    """
-    Collapse identical drug-disease pairs across sources while preserving
-    source support.
+def count_lf(lf):
+    return int(
+        lf.select(pl.len())
+        .collect(engine="streaming")
+        .item()
+    )
 
-    This file is useful for multi-source evidence analysis.
-    """
-    collapse_keys = [
-        "drug_name",
-        "drug_identifier",
-        "drug_identifier_type",
-        "disease_or_condition_name",
-        "disease_or_condition_identifier",
-        "disease_or_condition_identifier_type",
+
+def write_grouped_buckets(outputs, bucket_groups):
+    dedup_cols = CORE + [
+        "merge_assertion_id",
+        "merge_pair_id",
+        "supporting_event_count",
+        "representative_event_id",
     ]
 
-    collapsed = (
-        df.group_by(collapse_keys)
-        .agg(
+    pair_cols = IDENTITY + [
+        "merge_pair_id",
+        "supporting_event_count",
+        "supporting_assertion_count",
+        "supporting_source_count",
+        "supporting_sources",
+        "relationship_types",
+        "evidence_types",
+        "evidence_families",
+        "indication_like_event_count",
+        "contraindication_event_count",
+        "potential_conflict",
+        "identity_note",
+    ]
+
+    totals = {
+        "assertions": 0,
+        "pairs": 0,
+        "events": 0,
+        "potential_conflicts": 0,
+    }
+
+    with (
+        outputs["dedup"].open(
+            "w", encoding="utf8", newline=""
+        ) as da,
+        outputs["pairs"].open(
+            "w", encoding="utf8", newline=""
+        ) as pa,
+    ):
+        csv.writer(da).writerow(dedup_cols)
+        csv.writer(pa).writerow(pair_cols)
+
+        for part_files in tqdm(
+            bucket_groups,
+            desc="Aggregating identity buckets",
+            unit="bucket",
+        ):
+            # Read all fragments belonging to the same
+            # hash bucket together to avoid splitting groups.
+
+            event = pl.read_parquet(part_files)
+
+            if event.height == 0:
+                continue
+
+            totals["events"] += event.height
+
+            # Distinct source-level assertions.
+            # Each assertion retains an exact support count.
+            a = event.group_by(ASSERTION).agg([
+                pl.len().alias(
+                    "supporting_event_count"
+                ),
+                pl.col("merge_event_id")
+                .min()
+                .alias("representative_event_id"),
+                pl.col("merge_assertion_id").first(),
+                pl.col("merge_pair_id").first(),
+                pl.col("internal_source").first(),
+            ])
+
+            if (
+                a.select(
+                    pl.col(
+                        "merge_assertion_id"
+                    ).n_unique()
+                ).item()
+                != a.height
+            ):
+                raise RuntimeError(
+                    "Assertion hash collision detected"
+                )
+
+            a = a.select(dedup_cols)
+            a.write_csv(
+                da, include_header=False
+            )
+
+            totals["assertions"] += a.height
+
+            # Exact six-column identity groups.
+            # These are not cross-ontology mappings.
+            b = event.group_by(IDENTITY).agg([
+                pl.len().alias(
+                    "supporting_event_count"
+                ),
+
+                pl.col("merge_assertion_id")
+                .n_unique()
+                .alias("supporting_assertion_count"),
+
+                pl.col("source")
+                .n_unique()
+                .alias("supporting_source_count"),
+
+                pl.col("source")
+                .unique()
+                .sort()
+                .alias("_sources"),
+
+                pl.col("relationship_type")
+                .unique()
+                .sort()
+                .alias("_rels"),
+
+                pl.col("evidence_type")
+                .unique()
+                .sort()
+                .alias("_evidence"),
+
+                pl.col("merge_evidence_family")
+                .unique()
+                .sort()
+                .alias("_families"),
+
+                pl.col("merge_pair_id").first(),
+
+                (
+                    pl.col("merge_evidence_family")
+                    .is_in([
+                        "source_reported_approval",
+                        "source_reported_indication",
+                        "ctd_direct_therapeutic",
+                        "label_nlp_indication",
+                        "palliative_relation",
+                    ])
+                )
+                .sum()
+                .alias("indication_like_event_count"),
+
+                (
+                    pl.col("merge_evidence_family")
+                    == "contraindication"
+                )
+                .sum()
+                .alias("contraindication_event_count"),
+            ])
+
+            if (
+                b.select(
+                    pl.col("merge_pair_id").n_unique()
+                ).item()
+                != b.height
+            ):
+                raise RuntimeError(
+                    "Pair hash collision detected"
+                )
+
+            b = b.with_columns([
+                pl.col("_sources")
+                .list.join("|")
+                .alias("supporting_sources"),
+
+                pl.col("_rels")
+                .list.join("|")
+                .alias("relationship_types"),
+
+                pl.col("_evidence")
+                .list.join("|")
+                .alias("evidence_types"),
+
+                pl.col("_families")
+                .list.join("|")
+                .alias("evidence_families"),
+
+                (
+                    (pl.col(
+                        "indication_like_event_count"
+                    ) > 0)
+                    &
+                    (pl.col(
+                        "contraindication_event_count"
+                    ) > 0)
+                ).alias("potential_conflict"),
+
+                pl.lit(
+                    "exact six identity columns only; "
+                    "NOT ontology-resolved"
+                ).alias("identity_note"),
+            ]).select(pair_cols)
+
+            b.write_csv(
+                pa, include_header=False
+            )
+
+            totals["pairs"] += b.height
+
+            totals["potential_conflicts"] += int(
+                b["potential_conflict"].sum()
+            )
+
+            # Every event must be represented
+            # once in each summarisation scheme.
+            if (
+                int(
+                    a["supporting_event_count"].sum()
+                ) != event.height
+                or
+                int(
+                    b["supporting_event_count"].sum()
+                ) != event.height
+            ):
+                raise RuntimeError(
+                    "Source-event conservation failed "
+                    "inside identity bucket"
+                )
+
+            if (
+                b["supporting_assertion_count"].sum()
+                != a.height
+            ):
+                raise RuntimeError(
+                    "Assertion-to-pair conservation failed"
+                )
+
+    return totals, dedup_cols, pair_cols
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description=__doc__
+    )
+
+    root = Path(
+        os.environ.get(
+            "DRUG_DISEASE_ROOT",
+            Path(__file__).resolve().parent,
+        )
+    )
+
+    ap.add_argument(
+        "--processed-dir",
+        type=Path,
+        default=root / "data/processed",
+    )
+
+    ap.add_argument(
+        "--buckets",
+        type=int,
+        default=128,
+    )
+
+    ap.add_argument(
+        "--allow-count-drift",
+        action="store_true",
+    )
+
+    ap.add_argument(
+        "--recount-merged",
+        action="store_true",
+    )
+
+    ap.add_argument(
+        "--keep-work",
+        action="store_true",
+    )
+
+    args = ap.parse_args()
+
+    if args.buckets < 8 or args.buckets > 1024:
+        ap.error(
+            "--buckets must be 8..1024"
+        )
+
+    base = (
+        args.processed_dir
+        .expanduser()
+        .resolve()
+    )
+
+    if not base.is_dir():
+        ap.error(
+            f"Processed source directory missing: {base}"
+        )
+
+    work = base / ".polars_merge_work"
+
+    if work.exists():
+        raise RuntimeError(
+            f"Existing scratch folder: {work}; "
+            "inspect/remove it explicitly"
+        )
+
+    paths = {
+        k: base / v
+        for k, v in FILENAMES.items()
+    }
+
+    staged = {
+        k: base / (v + ".merging.tmp")
+        for k, v in FILENAMES.items()
+    }
+
+    if any(
+        p.exists() for p in staged.values()
+    ):
+        raise RuntimeError(
+            "A staged merger output already exists; "
+            "inspect/remove *.merging.tmp"
+        )
+
+    # Validate all eleven sources before
+    # starting any processing.
+    specs = []
+
+    for j, (
+        source,
+        rel,
+        expected,
+    ) in enumerate(SOURCES, 1):
+        path = base / rel
+
+        specs.append((
+            j,
+            source,
+            rel,
+            expected,
+            path,
+            csv_header(path),
+        ))
+
+    work.mkdir(parents=True)
+    completed = False
+
+    try:
+        print(
+            "[STEP 1] Polars streaming source "
+            "validation and Parquet staging",
+            flush=True,
+        )
+
+        manifests = []
+        individual = []
+
+        for (
+            j,
+            source,
+            rel,
+            expected,
+            path,
+            header,
+        ) in tqdm(
+            specs,
+            desc="Eleven sources",
+            unit="source",
+        ):
+            lf = make_source_lf(
+                source,
+                j,
+                rel,
+                path,
+                header,
+                args.buckets,
+            )
+
+            temp = (
+                work / f"source_{j:02d}.parquet"
+            )
+
+            lf.sink_parquet(
+                temp,
+                engine="streaming",
+                compression="zstd",
+            )
+
+            narrow = pl.scan_parquet(temp)
+            n = count_lf(narrow)
+
+            invalid = count_lf(
+                narrow.filter(
+                    blank("drug_name")
+                    | blank("disease_or_condition_name")
+                    | blank("relationship_type")
+                    | blank("evidence_type")
+                    | blank("merge_original_source")
+                )
+            )
+
+            if invalid:
+                raise RuntimeError(
+                    f"{source}: {invalid} ineligible "
+                    "or missing-evidence rows; "
+                    "no silent drop"
+                )
+
+            if (
+                not args.allow_count_drift
+                and n != expected
+            ):
+                raise RuntimeError(
+                    f"{source}: expected {expected:,}, "
+                    f"observed {n:,}; stop"
+                )
+
+            manifests.append({
+                "source": source,
+                "path": rel,
+                "expected": expected,
+                "observed": n,
+                "sha256": digest(path),
+                "source_columns": header,
+            })
+
+            individual.append(temp)
+
+            tqdm.write(
+                f"[OK] {source}: {n:,} source events"
+            )
+
+        expected_sum = sum(
+            m["observed"]
+            for m in manifests
+        )
+
+        print(
+            f"[STEP 2] Stream the COMPLETE "
+            f"event ledger "
+            f"({expected_sum:,} source events)",
+            flush=True,
+        )
+
+        # Diagonal concatenation retains
+        # all source-specific columns.
+        full = pl.concat(
             [
-                pl.col("source").unique().sort().str.join("|").alias("sources"),
-                pl.col("relationship_type").unique().sort().str.join("|").alias("relationship_types"),
-                pl.col("evidence_type").unique().sort().str.join("|").alias("evidence_types"),
-                pl.col("internal_source").unique().sort().str.join("|").alias("internal_sources"),
-                pl.len().alias("row_count_before_collapse"),
+                pl.scan_parquet(p)
+                for p in individual
+            ],
+            how="diagonal_relaxed",
+        )
+
+        event_fields = [
+            c for c in full.collect_schema().names()
+            if c not in CORE
+        ]
+
+        full = full.select(
+            CORE + event_fields
+        )
+
+        full.sink_csv(
+            staged["merged"],
+            engine="streaming",
+            maintain_order=True,
+        )
+
+        print(
+            "[STEP 3] Bucket narrow fields for "
+            "bounded-memory grouping",
+            flush=True,
+        )
+
+        narrow = full.select(
+            CORE + [
+                "merge_event_id",
+                "merge_assertion_id",
+                "merge_pair_id",
+                "merge_evidence_family",
+                "merge_bucket",
             ]
         )
-        .sort(["drug_name", "disease_or_condition_name"])
-    )
 
-    return collapsed
+        bucket_root = work / "buckets"
 
+        narrow.sink_parquet(
+            pl.PartitionBy(
+                bucket_root,
+                key="merge_bucket",
+                include_key=True,
+            ),
+            engine="streaming",
+            compression="zstd",
+            mkdir=True,
+        )
 
-def validate_no_unexpected_source_labels(
-    df: pl.DataFrame,
-    expected_sources: list[str],
-) -> None:
-    observed_sources = sorted(
-        df.select(pl.col("source").unique())
-        .to_series()
-        .to_list()
-    )
+        bucket_files = sorted(
+            bucket_root.rglob("*.parquet")
+        )
 
-    expected_sources_sorted = sorted(expected_sources)
+        if not bucket_files:
+            raise RuntimeError(
+                "No bucket Parquet files written"
+            )
 
-    unexpected = sorted(set(observed_sources) - set(expected_sources_sorted))
-    missing = sorted(set(expected_sources_sorted) - set(observed_sources))
+        # All fragments of one bucket must
+        # be read together before grouping.
+        grouped = defaultdict(list)
 
-    print_section("SOURCE LABEL VALIDATION")
+        for part_file in bucket_files:
+            grouped[part_file.parent].append(
+                part_file
+            )
 
-    print("[EXPECTED SOURCES]")
-    for s in expected_sources_sorted:
-        print(f"  - {s}")
+        bucket_groups = [
+            grouped[p]
+            for p in sorted(grouped)
+        ]
 
-    print("\n[OBSERVED SOURCES]")
-    for s in observed_sources:
-        print(f"  - {s}")
+        print(
+            f"[STEP 4] Aggregate "
+            f"{len(bucket_groups)} buckets "
+            f"across {len(bucket_files)} fragments",
+            flush=True,
+        )
 
-    if unexpected:
-        print("\n[WARNING] Unexpected source labels found:")
-        for s in unexpected:
-            print(f"  - {s}")
-    else:
-        print("\n[OK] No unexpected source labels found.")
+        (
+            counts,
+            assertion_cols,
+            pair_cols,
+        ) = write_grouped_buckets(
+            staged,
+            bucket_groups,
+        )
 
-    if missing:
-        print("\n[WARNING] Expected source labels missing from merged output:")
-        for s in missing:
-            print(f"  - {s}")
-    else:
-        print("[OK] All expected loaded source labels are present.")
+        if (
+            counts["events"] != expected_sum
+            or counts["assertions"] > counts["events"]
+            or counts["pairs"] > counts["assertions"]
+        ):
+            raise RuntimeError(
+                "Global reconciliation failed: "
+                f"{counts}; inputs={expected_sum}"
+            )
 
+        if args.recount_merged:
+            print(
+                "[STEP 5] Recount merged CSV "
+                "(extra scan)",
+                flush=True,
+            )
 
-# =============================================================================
-# MAIN
-# =============================================================================
+            actual = count_lf(
+                pl.scan_csv(
+                    staged["merged"],
+                    infer_schema=False,
+                )
+            )
 
-def main() -> None:
-    print_section("MERGING INCLUDED DRUG-DISEASE SOURCES")
-    print(f"[BASE] {BASE}")
+            if actual != expected_sum:
+                raise RuntimeError(
+                    f"Merged CSV readback "
+                    f"{actual:,} != {expected_sum:,}"
+                )
 
-    print("\n[INCLUDED SOURCES]")
-    for cfg in SOURCES:
-        print(f"  - {cfg['source']}")
+        report = {
+            "status": "success",
+            "completed_at_utc": now(),
+            "polars_version": pl.__version__,
+            "scope": "11 manuscript sources only",
+            "pinned_counts_enforced":
+                not args.allow_count_drift,
+            "sources": manifests,
+            "source_events": expected_sum,
+            "assertions": counts["assertions"],
+            "exact_identity_pairs": counts["pairs"],
+            "potential_conflicting_pairs":
+                counts["potential_conflicts"],
+            "assertion_key_columns": ASSERTION,
+            "pair_key_columns": IDENTITY,
+            "note": (
+                "Exact lexical/namespace equality only. "
+                "Distinct evidence classes preserved. "
+                "Polars hash keys depend on installed version."
+            ),
+            "outputs": {
+                k: str(v)
+                for k, v in paths.items()
+            },
+            "output_sha256": {
+                k: digest(staged[k])
+                for k in (
+                    "merged",
+                    "dedup",
+                    "pairs",
+                )
+            },
+            "schema": {
+                "full": CORE + event_fields,
+                "assertions": assertion_cols,
+                "pairs": pair_cols,
+            },
+        }
 
-    print("\n[EXCLUDED SOURCES]")
-    print("  - openFDA: inspection only, no final mapping output")
-    print("  - TTD: excluded until validated non-empty output is produced")
+        staged["summary"].write_text(
+            json.dumps(
+                report,
+                indent=2,
+                ensure_ascii=False,
+            ) + "\n",
+            encoding="utf8",
+        )
 
-    all_frames: list[pl.DataFrame] = []
-    source_reports: list[dict[str, Any]] = []
+        print(
+            "[STEP 6] Publish validated outputs "
+            "(summary last)",
+            flush=True,
+        )
 
-    for cfg in SOURCES:
-        df, report = load_one_source(cfg)
-        source_reports.append(report)
+        # Each replacement is atomic individually,
+        # but the four-file set is not transactional.
+        for k in (
+            "merged",
+            "dedup",
+            "pairs",
+            "summary",
+        ):
+            os.replace(
+                staged[k],
+                paths[k],
+            )
 
-        if df is not None:
-            all_frames.append(df)
+            print(
+                f"[PUBLISHED] {paths[k]}",
+                flush=True,
+            )
 
-    if not all_frames:
-        raise RuntimeError("No included source files were loaded. Nothing to merge.")
+        completed = True
 
-    print_section("CONCATENATING SOURCES")
+        print(
+            f"SUCCESS: {expected_sum:,} events; "
+            f"{counts['assertions']:,} assertions; "
+            f"{counts['pairs']:,} exact-identity pairs; "
+            f"{counts['potential_conflicts']:,} "
+            f"potential conflicts",
+            flush=True,
+        )
 
-    merged = pl.concat(all_frames, how="diagonal_relaxed")
-    merged = clean_text_columns(merged)
+    finally:
+        if completed or not args.keep_work:
+            shutil.rmtree(
+                work,
+                ignore_errors=True,
+            )
 
-    remaining_cols = [c for c in merged.columns if c not in UNIFIED_COLS]
-    merged = merged.select(UNIFIED_COLS + remaining_cols)
-
-    print(f"[MERGED ROWS BEFORE FINAL FILTER] {merged.height:,}")
-
-    before_final_filter = merged.height
-
-    merged = merged.filter(
-        (pl.col("drug_name").is_not_null())
-        & (pl.col("drug_name") != "")
-        & (pl.col("disease_or_condition_name").is_not_null())
-        & (pl.col("disease_or_condition_name") != "")
-    )
-
-    rows_dropped_final_filter = before_final_filter - merged.height
-
-    print(f"[MERGED ROWS AFTER FINAL FILTER]  {merged.height:,}")
-    print(f"[ROWS DROPPED FINAL FILTER]      {rows_dropped_final_filter:,}")
-
-    loaded_sources = [
-        r["source"]
-        for r in source_reports
-        if r["status"] == "loaded"
-    ]
-
-    validate_no_unexpected_source_labels(
-        merged,
-        expected_sources=loaded_sources,
-    )
-
-    print_section("DEDUPLICATING")
-
-    dedup_keys = [
-        "drug_name",
-        "drug_identifier",
-        "drug_identifier_type",
-        "disease_or_condition_name",
-        "disease_or_condition_identifier",
-        "disease_or_condition_identifier_type",
-        "relationship_type",
-        "evidence_type",
-        "source",
-    ]
-
-    dedup = merged.unique(subset=dedup_keys, keep="first")
-
-    print(f"[DEDUP ROWS]          {dedup.height:,}")
-    print(f"[DUPLICATES REMOVED] {merged.height - dedup.height:,}")
-
-    print_section("COLLAPSING SOURCE EVIDENCE")
-
-    collapsed = collapse_sources(dedup)
-
-    print(f"[COLLAPSED DRUG-DISEASE PAIRS] {collapsed.height:,}")
-
-    print_section("WRITING OUTPUTS")
-
-    OUTPUT_MERGED.parent.mkdir(parents=True, exist_ok=True)
-
-    merged.write_csv(OUTPUT_MERGED)
-    dedup.write_csv(OUTPUT_DEDUP)
-    collapsed.write_csv(OUTPUT_COLLAPSED)
-
-    skipped_sources = {
-        r["source"]: r["reason"]
-        for r in source_reports
-        if r["status"] != "loaded"
-    }
-
-    merged_source_counts = count_by_column(merged, "source")
-    dedup_source_counts = count_by_column(dedup, "source")
-    relationship_counts = count_by_column(dedup, "relationship_type")
-    evidence_counts = count_by_column(dedup, "evidence_type")
-
-    summary = {
-        "timestamp_utc": now_utc(),
-        "base_directory": str(BASE),
-        "included_sources_requested": [cfg["source"] for cfg in SOURCES],
-        "excluded_sources": {
-            "openFDA": "Inspection script only; no final drug-disease mapping output.",
-            "TTD": "Excluded until valid non-empty outputs are produced.",
-        },
-        "loaded_sources": loaded_sources,
-        "skipped_sources": skipped_sources,
-        "source_reports": source_reports,
-        "unified_columns": UNIFIED_COLS,
-        "controlled_source_label_note": (
-            "The top-level source and internal_source columns are forced from "
-            "the merge configuration to maintain controlled source labels. "
-            "Original file provenance is retained in merge_input_file, "
-            "merge_input_filename, merge_source_label, and "
-            "merge_internal_source_label."
-        ),
-        "deduplication_keys": dedup_keys,
-        "rows_merged": int(merged.height),
-        "rows_deduplicated": int(dedup.height),
-        "duplicates_removed": int(merged.height - dedup.height),
-        "rows_collapsed_drug_disease_pairs": int(collapsed.height),
-        "rows_dropped_final_filter": int(rows_dropped_final_filter),
-        "per_source_rows_merged": merged_source_counts,
-        "per_source_rows_deduplicated": dedup_source_counts,
-        "relationship_type_counts_deduplicated": relationship_counts,
-        "evidence_type_counts_deduplicated": evidence_counts,
-        "outputs": {
-            "merged": str(OUTPUT_MERGED),
-            "deduplicated": str(OUTPUT_DEDUP),
-            "source_collapsed": str(OUTPUT_COLLAPSED),
-            "summary": str(OUTPUT_SUMMARY),
-        },
-        "output_sha256": {
-            "merged": sha256_file(OUTPUT_MERGED),
-            "deduplicated": sha256_file(OUTPUT_DEDUP),
-            "source_collapsed": sha256_file(OUTPUT_COLLAPSED),
-        },
-    }
-
-    with open(OUTPUT_SUMMARY, "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2)
-
-    print(f"[SAVED] {OUTPUT_MERGED}")
-    print(f"        rows={merged.height:,}")
-    print(f"        sha256={sha256_file(OUTPUT_MERGED)}")
-
-    print(f"[SAVED] {OUTPUT_DEDUP}")
-    print(f"        rows={dedup.height:,}")
-    print(f"        sha256={sha256_file(OUTPUT_DEDUP)}")
-
-    print(f"[SAVED] {OUTPUT_COLLAPSED}")
-    print(f"        rows={collapsed.height:,}")
-    print(f"        sha256={sha256_file(OUTPUT_COLLAPSED)}")
-
-    print(f"[SAVED] {OUTPUT_SUMMARY}")
-
-    print_section("SUMMARY")
-
-    print("[LOADED SOURCES]")
-    for source in loaded_sources:
-        n = merged_source_counts.get(source, 0)
-        print(f"  - {source}: {n:,} merged rows")
-
-    if skipped_sources:
-        print("\n[SKIPPED SOURCES]")
-        for source, reason in skipped_sources.items():
-            print(f"  - {source}: {reason}")
-
-    print()
-    print(f"[TOTAL MERGED ROWS]       {merged.height:,}")
-    print(f"[TOTAL DEDUPLICATED ROWS] {dedup.height:,}")
-    print(f"[COLLAPSED PAIRS]         {collapsed.height:,}")
-
-    print("=" * 100)
-    print("DONE")
-    print("=" * 100)
+        if not completed:
+            for path in staged.values():
+                path.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
