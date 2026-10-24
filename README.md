@@ -1,366 +1,345 @@
- 
-# Drug–Disease Association Data Pipeline
+# Source-aware drug–disease relationship dataset and processing pipeline
 
-A reproducible, source-aware pipeline for downloading, processing, harmonising, merging, and deduplicating drug–disease relationships from public biomedical resources.
+**Muhammad Muneeb** · [GitHub](https://github.com/MuhammadMuneeb007) · [Project repository](https://github.com/MuhammadMuneeb007/drug-disease-mapping)
 
-This repository was created to build an analysis-ready drug–disease relationship dataset while preserving source provenance, relationship semantics, and evidence type. The dataset should be interpreted as a heterogeneous biomedical relationship resource, not as a database of uniformly approved drug indications.
+A reproducible, source-aware workflow for extracting, harmonising, integrating, and evaluating drug–disease relationships from **11 biomedical resources**. The project retains original source identifiers, relationship and evidence classes, and supporting-event provenance. It is intended for biomedical data integration, computational research, evidence-aware retrieval, and hypothesis generation—not as a catalogue of uniformly approved or clinically effective treatments.
 
-![Pairwise drug–disease pair overlap heatmap](pairwise_drug_disease_pair_overlap_heatmap.png)
+**Manuscript:** *A source-aware drug–disease relationship dataset integrating public biomedical resources* — Muhammad Muneeb and David B. Ascher.
 
----
-## Licence
+> **Release status (October 2026).** The numbers below describe the **validated 11-source Version 2 analysis**, not necessarily the files currently deposited on Zenodo. The [existing project Zenodo record](https://doi.org/10.5281/zenodo.18308460) is an earlier project record. The matching Version 2 deposit, final DOI, archive checksums, and immutable code tag must be confirmed before calling this a completed release. Source-specific redistribution clearance also remains under review.
 
-The source code in this repository is released under the **MIT Licence**.
+## Contents
 
-This licence applies only to the pipeline code, analysis scripts, documentation, and repository materials created for this project. The integrated drug–disease dataset is derived from multiple third-party public biomedical databases, and each original data source retains its own licence, terms of use, attribution requirements, and redistribution conditions.
+- [Validated dataset summary](#validated-dataset-summary)
+- [Sources and versions](#sources-and-versions)
+- [Data layers and schema](#data-layers-and-schema)
+- [Installation](#installation)
+- [Full processing workflow](#full-processing-workflow)
+- [Analysis scripts](#analysis-scripts)
+- [Technical validation](#technical-validation)
+- [Licensing and redistribution](#licensing-and-redistribution)
+- [Data availability and release provenance](#data-availability-and-release-provenance)
+- [Citation and acknowledgements](#citation-and-acknowledgements)
 
-Users must therefore follow the licence and reuse terms of each original database when using, redistributing, or building upon the processed dataset. In particular, some sources may have non-commercial, attribution, share-alike, or redistribution-sensitive conditions.
+## Validated dataset summary
 
-In summary:
+These statistics are from the locked manuscript-analysis inputs processed and audited on **24 October 2026**.
 
-- **Pipeline code:** MIT Licence.
-- **Processed integrated dataset:** Use according to the licence and reuse terms of the original source databases.
-- **Third-party source data:** Remain governed by their respective database licences and terms of use.
-- **Citation:** Users should cite this Zenodo dataset and the original databases used in their analysis.
-
-This repository does not override or replace the licence terms of AACT / ClinicalTrials.gov, ChEMBL, CTD, DrugCentral, Open Targets, SIDER, Hetionet, MEDI, PrimeKG, Broad Drug Repurposing Hub, repoDB, or any other upstream data source.
-
-
-## Data availability
-
-The processed dataset is available on Zenodo:
-
-- **DOI:** https://doi.org/10.5281/zenodo.18308460  
-- **Zenodo record:** https://zenodo.org/records/18308460  
-
-Please cite the Zenodo dataset and the original source databases when using this resource.
-
----
-
-## Overview
-
-The pipeline integrates drug–disease, chemical–disease, clinical trial intervention–condition, medication–indication, drug repurposing, and knowledge-graph compound–disease relationships from public biomedical sources.
-
-The current release integrates **11 included sources**:
-
-1. AACT / ClinicalTrials.gov  
-2. ChEMBL  
-3. Comparative Toxicogenomics Database  
-4. DrugCentral  
-5. Open Targets Platform  
-6. SIDER 4.1  
-7. Hetionet  
-8. MEDI  
-9. PrimeKG  
-10. Broad Drug Repurposing Hub  
-11. repoDB  
-
-The pipeline standardises each source into a common schema, preserves source-specific metadata, merges all records, performs schema-record deduplication, and generates downstream quality-control summaries and overlap analyses.
-
----
-
-## Current dataset summary
-
-| Metric | Value |
+| Measurement | Validated value |
 |---|---:|
-| Included sources | 11 |
-| Raw merged rows | 10,870,837 |
-| Source-level deduplicated rows | 4,465,457 |
-| Duplicates removed | 6,405,380 |
-| Duplicate-removal rate | 58.923% |
-| Source-collapsed schema-level records | 4,464,947 |
-| Unique normalised drug names | 152,957 |
-| Unique normalised disease/condition names | 69,346 |
-| Unique normalised drug–disease name pairs | 4,300,425 |
-| Rows with both drug and disease identifiers | 3,976,485 |
-| Rows with neither identifier | 488,945 |
+| Included original resources | **11** |
+| Harmonised source evidence events | **10,895,395** |
+| Distinct source-specific assertions | **4,534,385** |
+| Additional supporting events represented by assertion counts | **6,361,010** |
+| Strict-identity drug–disease pairs | **4,470,601** |
+| Distinct conservatively normalised drug-name keys | **158,364** |
+| Distinct conservatively normalised disease/condition-name keys | **72,563** |
+| Distinct conservatively normalised drug–disease name pairs | **4,313,189** |
+| Normalised-name pairs present in 2+ sources | **83,878 (1.945%)** |
+| Potentially conflicting strict-identity pairs | **87** |
+| Original relationship types / evidence types | **18 / 28** |
+| Analytical evidence families | **14** |
 
-Deduplication was performed using a schema-record key consisting of:
+**Interpretation:** Events, assertions, strict-identity pairs, and normalised-name pairs are *different counting units*. The 6,361,010 additional supporting events were retained in the event ledger and accounted for through assertion support counts; they are **not** 6.36 million deleted or independently validated biological observations. Conservatively equal drug/disease names do not establish chemical or ontology-level identity.
 
-```text
-drug_name
-drug_identifier
-drug_identifier_type
-disease_or_condition_name
-disease_or_condition_identifier
-disease_or_condition_identifier_type
-relationship_type
-evidence_type
-source
-````
+### Contributions of each source
 
-This means that records from different sources, or records with different relationship or evidence semantics, are retained separately.
+| Source | Evidence events | Assertions | Additional supporting events |
+|---|---:|---:|---:|
+| AACT | 688,745 | 485,060 | 203,685 |
+| Broad Drug Repurposing Hub | 3,892 | 3,885 | 7 |
+| ChEMBL | 60,055 | 59,751 | 304 |
+| CTD | 9,735,698 | 3,592,638 | 6,143,060 |
+| DrugCentral | 42,515 | 42,479 | 36 |
+| Hetionet | 1,145 | 1,145 | 0 |
+| MEDI | 222,412 | 222,412 | 0 |
+| Open Targets | 53,950 | 53,950 | 0 |
+| PrimeKG | 42,631 | 42,631 | 0 |
+| repoDB | 13,558 | 12,118 | 1,440 |
+| SIDER | 30,794 | 18,316 | 12,478 |
+| **Total** | **10,895,395** | **4,534,385** | **6,361,010** |
 
----
+CTD's large reduction from evidence events to assertions mainly reflects multiple inferred-gene and publication-associated events underlying the same chemical–disease assertion. AACT similarly retains distinct trial-level contexts. The source-event ledger, rather than the assertion layer, should be used when those contexts are needed.
 
-## Data sources
+## Sources and versions
 
-| Source                     | Script           | Access point                                                                                                               | Description and interpretation                                                                                                                                                                                  | Reuse note                                                                  |
-| -------------------------- | ---------------- | -------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
-| AACT / ClinicalTrials.gov  | `aact.py`        | [https://ctti-aact.nyc3.digitaloceanspaces.com](https://ctti-aact.nyc3.digitaloceanspaces.com)                             | Clinical trial intervention–condition records generated from AACT flat files. These represent clinical trial co-occurrence and should not be interpreted as approved indications or positive efficacy evidence. | Public clinical trial data; verify AACT and ClinicalTrials.gov reuse terms. |
-| ChEMBL                     | `chembl.py`      | [https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/latest/](https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/latest/) | Curated drug indication and clinical-phase evidence extracted from ChEMBL drug indication tables.                                                                                                               | ChEMBL reuse terms; attribution required.                                   |
-| CTD                        | `ctd.py`         | [https://ctdbase.org/reports/](https://ctdbase.org/reports/)                                                               | Broad chemical–disease association source. CTD records include curated and inferred chemical–disease links and should not be interpreted as approved drug indications.                                          | Verify CTD reuse terms.                                                     |
-| DrugCentral                | `drugcentral.py` | [https://drugcentral.org/download](https://drugcentral.org/download)                                                       | Structured drug–condition clinical relationship source. Relationship labels include indication, contraindication, off-label use, treatment, diagnosis, and risk reduction.                                      | Verify DrugCentral reuse terms.                                             |
-| Open Targets Platform      | `opentargets.py` | [https://ftp.ebi.ac.uk/pub/databases/opentargets](https://ftp.ebi.ac.uk/pub/databases/opentargets)                         | Drug–disease clinical indication evidence with clinical phase and reference metadata.                                                                                                                           | Open Targets reuse terms.                                                   |
-| SIDER 4.1                  | `sider.py`       | [https://sideeffects.embl.de/](https://sideeffects.embl.de/)                                                               | Label-derived indication records extracted from SIDER indication files.                                                                                                                                         | Verify SIDER reuse terms.                                                   |
-| Hetionet                   | `hetionet.py`    | [https://github.com/hetio/hetionet](https://github.com/hetio/hetionet)                                                     | Biomedical knowledge-graph compound–disease relationships. Retained edges include compound-treats-disease and compound-palliates-disease.                                                                       | CC0.                                                                        |
-| MEDI                       | `MEDI.py`        | [https://www.vumc.org/wei-lab/medi](https://www.vumc.org/wei-lab/medi)                                                     | Medication–indication ensemble resource. ICD-coded and UMLS-coded MEDI records are processed separately.                                                                                                        | CC BY-NC-SA; redistribution-sensitive.                                      |
-| PrimeKG                    | `PrimeKG.py`     | [https://doi.org/10.7910/DVN/IXA7BM](https://doi.org/10.7910/DVN/IXA7BM)                                                   | Biomedical knowledge-graph drug–disease relationships. Retained relationships include indication, contraindication, and off-label use.                                                                          | MIT licence noted in source documentation.                                  |
-| Broad Drug Repurposing Hub | `Broad.py`       | [https://repo-hub.broadinstitute.org/repurposing](https://repo-hub.broadinstitute.org/repurposing)                         | Drug repurposing and development-stage annotation source. Indication fields are expanded into drug–condition rows.                                                                                              | Non-commercial / redistribution-sensitive.                                  |
-| repoDB                     | `repoDB.py`      | [https://unmtid-shinyapps.net/shiny/repodb/](https://unmtid-shinyapps.net/shiny/repodb/)                                   | Drug repositioning and indication-status resource. Approved records and failed/discontinued records are retained with separate evidence labels.                                                                 | Verify repoDB reuse terms.                                                  |
+The included source processors write harmonised CSV files for **exactly eleven** resources. Source download/release labels are not automatically equivalent to the original acquisition timestamp.
 
----
+| Resource | Inspected input / version | Processor | Primary source |
+|---|---|---|---|
+| AACT / ClinicalTrials.gov | Local archive labelled `aact_20260114` | [`aact.py`](aact.py) | [AACT](https://aact.ctti-clinicaltrials.org/) |
+| Broad Drug Repurposing Hub | Annotation file labelled `20200324` | [`Broad.py`](Broad.py) | [Repurposing Hub](https://repo-hub.broadinstitute.org/repurposing) |
+| ChEMBL | **ChEMBL 37** | [`chembl.py`](chembl.py) | [ChEMBL downloads](https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/chembl_37/) |
+| Comparative Toxicogenomics Database (CTD) | Chemical–disease report generated **2026-04-30** | [`ctd.py`](ctd.py) | [CTD](https://ctdbase.org/) |
+| DrugCentral | Database version **56**, frozen extraction **2026-10-24** | [`drugcentral.py`](drugcentral.py) | [DrugCentral](https://drugcentral.org/download) |
+| Hetionet | v1.0 | [`hetionet.py`](hetionet.py) | [Hetionet](https://github.com/hetio/hetionet) |
+| MEDI | MEDI-2 (ICD and UMLS inputs) | [`MEDI.py`](MEDI.py) | [MEDI](https://www.vumc.org/wei-lab/medi) |
+| Open Targets Platform | **26.03** | [`opentargets.py`](opentargets.py) | [Release directory](https://ftp.ebi.ac.uk/pub/databases/opentargets/platform/26.03/) |
+| PrimeKG | Harvard Dataverse `kg.csv` snapshot | [`PrimeKG.py`](PrimeKG.py) | [PrimeKG dataset](https://doi.org/10.7910/DVN/IXA7BM) |
+| repoDB | Local full export; exact upstream revision unconfirmed | [`repoDB.py`](repoDB.py) | [repoDB](https://unmtid-shinyapps.net/shiny/repodb/) |
+| SIDER | SIDER 4.1 indication files | [`sider.py`](sider.py) | [SIDER](https://sideeffects.embl.de/) |
 
-## Scripts in this repository
+**Not included:** [`TTD.py`](TTD.py) and [`openFDA.py`](openFDA.py) are exploratory processors and do **not** contribute to the locked eleven-source integration. Do not add their outputs without a documented and revalidated change to the source manifest.
 
-| Script                                            | Purpose                                                                                                     |
-| ------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| `aact.py`                                         | Downloads and processes AACT / ClinicalTrials.gov intervention–condition data.                              |
-| `chembl.py`                                       | Downloads the latest ChEMBL SQLite release and extracts drug indication evidence.                           |
-| `ctd.py`                                          | Processes CTD chemical–disease association files.                                                           |
-| `drugcentral.py`                                  | Processes DrugCentral drug–condition relationship records.                                                  |
-| `opentargets.py`                                  | Processes Open Targets clinical indication, drug molecule, and disease files.                               |
-| `sider.py`                                        | Processes SIDER drug indication files.                                                                      |
-| `MEDI.py`                                         | Processes MEDI-2 ICD-coded and UMLS-coded medication–indication files.                                      |
-| `hetionet.py`                                     | Processes Hetionet compound–disease edges.                                                                  |
-| `PrimeKG.py`                                      | Processes PrimeKG drug–disease relationships.                                                               |
-| `Broad.py`                                        | Processes Broad Drug Repurposing Hub annotation data.                                                       |
-| `repoDB.py`                                       | Processes locally downloaded repoDB full dataset.                                                           |
-| `TTD.py`                                          | Processes Therapeutic Target Database drug–disease mapping files.                                           |
-| `openFDA.py`                                      | Downloads openFDA label partitions for inspection; not currently used to build final drug–disease mappings. |
-| `Analysis_00_MergeDatabases.py`                   | Merges harmonised source outputs into a unified dataset and performs deduplication.                         |
-| `Analysis_01_Source_level_dataset_composition.py` | Generates source-level composition summaries and overlap analyses.                                          |
+## Data layers and schema
 
----
+The source-specific files share ten leading columns:
 
-## Pipeline architecture
+| Column | Meaning |
+|---|---|
+| `drug_name` | Source-derived drug, substance, chemical, or intervention label |
+| `drug_identifier` | Reported drug identifier, if supplied |
+| `drug_identifier_type` | Drug identifier namespace |
+| `disease_or_condition_name` | Reported disease, condition, phenotype, or indication label |
+| `disease_or_condition_identifier` | Reported condition identifier, if supplied |
+| `disease_or_condition_identifier_type` | Condition identifier namespace |
+| `relationship_type` | Original/harmonised relationship classification |
+| `evidence_type` | Source-defined evidence classification |
+| `source` | Contributing database |
+| `internal_source` | Internal source or evidence subset |
 
-```text
-Raw public source files
-        |
-        v
-Source-specific processing scripts
-        |
-        v
-Unified drug–disease schema
-        |
-        v
-Merged source-level dataset
-        |
-        v
-Schema-record deduplication
-        |
-        v
-Source-aware deduplicated dataset
-        |
-        v
-Quality-control and overlap analyses
+Additional source-specific columns retain available trial IDs, PubMed IDs, inferred genes, original identifiers, clinical stages, source rows, and other provenance. Not every source has the same optional fields.
+
+### Three complementary output representations
+
+| File under `data/processed/` | Unit of analysis | Meaning |
+|---|---|---|
+| `ALL_INCLUDED_SOURCES_drug_disease_merged.csv` | **Evidence events** | Pre-deduplication **harmonised** source event ledger; this is *not* an untouched raw-source dump |
+| `ALL_INCLUDED_SOURCES_drug_disease_deduplicated.csv` | **Source-specific assertions** | Unique 9-field source-semantic states, with supporting-event counts and preserved evidence links |
+| `ALL_INCLUDED_SOURCES_drug_disease_source_collapsed.csv` | **Strict-identity pairs** | Exact agreement across the six represented drug/disease name, identifier and namespace fields; evidence and source support remain available |
+
+The **assertion identity** uses the six drug/disease identity fields plus `relationship_type`, `evidence_type`, and `source`. **Strict-identity pairs** use the six identity fields alone. A separate descriptive lexical analysis lowercases, trims, and collapses whitespace in names; it does **not** resolve synonyms, stereoisomers, salts, drug classes, brand names, disease ontologies, or chemical equivalence.
+
+```mermaid
+flowchart TD
+    A[11 frozen biomedical inputs] --> B[11 source-specific Python processors]
+    B --> C[Harmonised events with original evidence metadata]
+    C --> D[Event ledger: 10,895,395]
+    D --> E[Source-specific assertions: 4,534,385]
+    E --> F[Strict-identity pairs: 4,470,601]
+    D --> G[Integrity and join checks]
+    E --> H[Evidence semantics and lexical overlap]
+    F --> I[Retrieval and validation analyses]
 ```
-
----
-
-## Harmonised output schema
-
-The integrated dataset uses a common source-aware schema. Core fields include:
-
-| Column                                 | Description                                                                                                                                                       |
-| -------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `drug_name`                            | Drug, compound, chemical, or intervention name.                                                                                                                   |
-| `drug_identifier`                      | Source-provided or harmonised drug identifier where available.                                                                                                    |
-| `drug_identifier_type`                 | Identifier namespace for the drug identifier.                                                                                                                     |
-| `disease_or_condition_name`            | Disease, condition, indication, phenotype, or clinical trial condition name.                                                                                      |
-| `disease_or_condition_identifier`      | Source-provided or harmonised disease/condition identifier where available.                                                                                       |
-| `disease_or_condition_identifier_type` | Identifier namespace for the disease/condition identifier.                                                                                                        |
-| `relationship_type`                    | Harmonised relationship class, such as indication, contraindication, off-label use, clinical trial drug–condition co-occurrence, or chemical–disease association. |
-| `evidence_type`                        | Source-specific evidence class describing how the relationship should be interpreted.                                                                             |
-| `source`                               | Primary source database.                                                                                                                                          |
-| `internal_source`                      | Source-specific subcategory or processing layer.                                                                                                                  |
-| `extra_metadata`                       | Source-specific metadata preserved as structured information where available.                                                                                     |
-
----
-
-## Evidence and relationship interpretation
-
-The dataset intentionally preserves heterogeneous evidence semantics. Records should not be interpreted as equivalent.
-
-Examples of retained evidence classes include:
-
-| Evidence class                                    | Interpretation                                                           |
-| ------------------------------------------------- | ------------------------------------------------------------------------ |
-| `chemical_disease_association`                    | CTD chemical–disease association; not necessarily therapeutic.           |
-| `aact_clinical_trial_drug_condition_cooccurrence` | Drug intervention and condition co-occurrence in clinical trial records. |
-| `curated_drug_indication`                         | Curated ChEMBL drug indication evidence.                                 |
-| `opentargets_clinical_indication`                 | Open Targets clinical indication evidence with clinical phase metadata.  |
-| `sider_label_derived_indication`                  | Drug indication evidence extracted from drug labels.                     |
-| `medi_high_precision_indication`                  | High-precision MEDI medication–indication evidence.                      |
-| `medi_ensemble_indication`                        | Broader MEDI ensemble medication–indication evidence.                    |
-| `drugcentral_indication`                          | DrugCentral indication relationship.                                     |
-| `drugcentral_contraindication`                    | DrugCentral contraindication relationship.                               |
-| `drugcentral_off_label_use`                       | DrugCentral off-label use relationship.                                  |
-| `primekg_indication`                              | PrimeKG knowledge-graph indication relationship.                         |
-| `primekg_contraindication`                        | PrimeKG knowledge-graph contraindication relationship.                   |
-| `primekg_off_label_use`                           | PrimeKG knowledge-graph off-label use relationship.                      |
-| `repodb_approved_indication`                      | repoDB approved indication status.                                       |
-| `repodb_failed_or_discontinued_indication`        | repoDB failed, terminated, withdrawn, suspended, or discontinued status. |
-| `hetionet_compound_treats_disease`                | Hetionet compound-treats-disease edge.                                   |
-| `hetionet_compound_palliates_disease`             | Hetionet compound-palliates-disease edge.                                |
-| `broad_repurposing_hub`                           | Broad Drug Repurposing Hub annotation evidence.                          |
-
----
-
-## Source-level composition
-
-| Source                     | Raw merged rows | Deduplicated rows | Duplicates removed | Duplicates removed (%) | Unique normalised drug names | Unique normalised disease names | Unique normalised drug–disease name pairs |
-| -------------------------- | --------------: | ----------------: | -----------------: | ---------------------: | ---------------------------: | ------------------------------: | ----------------------------------------: |
-| CTD                        |       9,735,698 |         3,530,168 |          6,205,530 |                 63.740 |                       17,835 |                           7,278 |                                 3,529,647 |
-| AACT                       |         671,335 |           485,060 |            186,275 |                 27.747 |                      130,823 |                          50,813 |                                   462,200 |
-| MEDI                       |         222,412 |           222,412 |                  0 |                  0.000 |                        3,056 |                          13,233 |                                   206,126 |
-| ChEMBL                     |          59,887 |            59,583 |                304 |                  0.508 |                       10,054 |                           2,543 |                                    59,511 |
-| OpenTargets                |          53,950 |            53,950 |                  0 |                  0.000 |                       11,401 |                           3,080 |                                    53,896 |
-| PrimeKG                    |          42,631 |            42,631 |                  0 |                  0.000 |                        2,074 |                           2,054 |                                    42,383 |
-| DrugCentral                |          38,430 |            38,397 |                 33 |                  0.086 |                        2,775 |                           2,664 |                                    38,394 |
-| SIDER                      |          29,834 |            17,654 |             12,180 |                 40.826 |                        1,281 |                           3,043 |                                    16,690 |
-| repoDB                     |          11,623 |            10,572 |              1,051 |                  9.042 |                        2,321 |                           1,462 |                                     9,731 |
-| Broad Drug Repurposing Hub |           3,892 |             3,885 |                  7 |                  0.180 |                        2,221 |                             670 |                                     3,884 |
-| Hetionet                   |           1,145 |             1,145 |                  0 |                  0.000 |                          551 |                              91 |                                     1,145 |
-| **Total**                  |  **10,870,837** |     **4,465,457** |      **6,405,380** |             **58.923** |                            — |                               — |                                         — |
-
----
-
-## Normalised-name coverage
-
-| Metric                                                |     Value |
-| ----------------------------------------------------- | --------: |
-| Total source-level deduplicated rows                  | 4,465,457 |
-| Included sources                                      |        11 |
-| Unique normalised drug names                          |   152,957 |
-| Unique normalised disease/condition names             |    69,346 |
-| Unique normalised drug–disease name pairs             | 4,300,425 |
-| Rows with drug identifier                             | 3,976,512 |
-| Rows with disease/condition identifier                | 3,976,485 |
-| Rows with both drug and disease/condition identifiers | 3,976,485 |
-| Rows with neither identifier                          |   488,945 |
-| Drug identifier row coverage                          |   89.051% |
-| Disease/condition identifier row coverage             |   89.050% |
-| Both identifier row coverage                          |   89.050% |
-| Neither identifier row coverage                       |   10.949% |
-
----
-
-## Cross-source overlap
-
-Cross-source overlap was calculated using normalised names rather than strict source-specific identifiers. This was done because the included sources use heterogeneous identifier namespaces.
-
-| Level                  | Source-key rows | Source-collapsed keys | Single-source keys | Single-source (%) | Multi-source keys | Multi-source (%) | Max sources |
-| ---------------------- | --------------: | --------------------: | -----------------: | ----------------: | ----------------: | ---------------: | ----------: |
-| Drug                   |         169,787 |               138,219 |            126,362 |            91.422 |            11,857 |            8.578 |          11 |
-| Disease/condition      |          85,389 |                67,284 |             58,919 |            87.568 |             8,365 |           12.432 |          11 |
-| Drug–disease name pair |       4,385,333 |             4,253,477 |          4,164,802 |            97.915 |            88,675 |            2.085 |          11 |
-
-The heatmap at the top of this README shows pairwise overlap between sources at the normalised drug–disease name-pair level.
-
----
-
-## Download behaviour
-
-| Source                     | Download behaviour                                                                                     |
-| -------------------------- | ------------------------------------------------------------------------------------------------------ |
-| AACT                       | Uses a pinned AACT ZIP export and reads `interventions.txt`, `conditions.txt`, and `studies.txt`.      |
-| CTD                        | Downloads CTD chemical–disease reports from CTD.                                                       |
-| ChEMBL                     | Dynamically resolves the latest ChEMBL SQLite archive from the official FTP directory.                 |
-| DrugCentral                | Uses the DrugCentral dump or public PostgreSQL connection details.                                     |
-| Open Targets               | Downloads release-specific parquet files for clinical indication, drug molecule, and disease datasets. |
-| SIDER                      | Tries HTTPS and HTTP download locations for SIDER indication files.                                    |
-| MEDI                       | Downloads MEDI-2 ICD-coded and UMLS-coded files.                                                       |
-| Hetionet                   | Downloads Hetionet v1.0 nodes and edges from GitHub.                                                   |
-| PrimeKG                    | Downloads PrimeKG from Harvard Dataverse.                                                              |
-| Broad Drug Repurposing Hub | Processes Broad Repurposing Hub annotation files.                                                      |
-| repoDB                     | Expects the full repoDB TSV to be downloaded manually and placed locally.                              |
-| TTD                        | Processes TTD drug–disease and crossmatching files.                                                    |
-| openFDA                    | Reads the openFDA download manifest and downloads label files for inspection only.                     |
-
----
 
 ## Installation
 
 ```bash
-pip install requests pandas polars duckdb psycopg2-binary pyarrow
+# Clone the project
+ git clone git@github.com:MuhammadMuneeb007/drug-disease-mapping.git
+ cd drug-disease-mapping
+
+# Create an environment
+ python3 -m venv .venv
+ source .venv/bin/activate
+
+# Dependencies used across the processors, merger, and analyses
+ python -m pip install 'polars==1.44.1' tqdm pandas pyarrow duckdb requests psycopg2-binary rich numpy matplotlib
 ```
 
-Additional standard-library modules used by some scripts include:
+Python must have access to the **original compatible source files**, enough disk space for the event ledger and work partitions, and sufficient RAM. Several source processors assume project-relative raw files or an HPC-specific path. Check each processor's `--help` and existing source inventory before running. **On shared clusters, schedule large acquisition, merging, and QC work on a compute node rather than a login node.**
+
+For the validated integration, the observed Polars version was **1.44.1**. Hash-derived IDs can be version-dependent. Use the recorded environment, source checksums, and the final tagged Git commit to reproduce an exact deposited release.
+
+## Full processing workflow
+
+### 1. Prepare the original source inputs
+
+Obtain the correct source versions from the official publishers in accordance with their terms. The expected source locations include:
 
 ```text
-sqlite3
-tarfile
-gzip
-json
-pathlib
-zipfile
+data/raw/aact_20260114/aact_export.zip
+data/raw/broad_repurposing/repurposing_drugs_20200324.txt
+data/raw/chembl/chembl_37_sqlite.tar.gz
+data/raw/ctd/CTD_chemicals_diseases.tsv.gz
+data/raw/hetionet/hetionet-v1.0-nodes.tsv
+data/raw/hetionet/hetionet-v1.0-edges.sif.gz
+data/raw/medi/MEDI-2.csv
+data/raw/medi/MEDI-2_UMLS.csv
+data/raw/repodb/repodb_full_download.tsv
+data/raw/sider/drug_names.tsv
+data/raw/sider/meddra_all_indications.tsv.gz
 ```
 
----
+Other inputs include the Open Targets 26.03 Parquet files, the PrimeKG `kg.csv` download and the frozen DrugCentral relationship snapshot. **These large upstream datasets are not bundled with the GitHub code**, and a successful installation does not automatically download or license them.
 
-## Example usage
+### 2. Process the eleven included sources
 
-Run individual source-processing scripts first:
+Run these scripts **only after their corresponding source inputs are available**. They can overwrite the relevant files under `data/processed/`. Check each script's source-specific options before rerunning a locked integration.
 
 ```bash
 python aact.py
+python Broad.py
 python chembl.py
 python ctd.py
-python drugcentral.py
-python opentargets.py
-python sider.py
-python MEDI.py
+python drugcentral.py --offline   # Reuses the frozen local DrugCentral snapshot
 python hetionet.py
+python MEDI.py
+python opentargets.py --offline
 python PrimeKG.py
-python Broad.py
 python repoDB.py
+python sider.py
 ```
 
-Then merge and deduplicate the harmonised outputs:
+The eleven files required by the merger must be present at these precise relative paths:
+
+```text
+data/processed/aact/aact_drug_disease.csv
+data/processed/broad_repurposing/broad_repurposing_drug_disease.csv
+data/processed/chembl_drug_disease.csv
+data/processed/ctd_aggregate_chemical_disease.csv
+data/processed/drugcentral_drug_disease.csv
+data/processed/hetionet/hetionet_drug_disease.csv
+data/processed/medi/medi_drug_disease.csv
+data/processed/opentargets_drug_disease.csv
+data/processed/primekg/primekg_drug_disease.csv
+data/processed/repodb/repodb_drug_disease.csv
+data/processed/sider/sider_drug_disease.csv
+```
+
+These are the input filenames hardcoded in [`Analysis_00_MergeDatabases.py`](Analysis_00_MergeDatabases.py); do not rename them or substitute raw archives. Some scripts use pinned input files by default and will fail rather than silently download missing data. `drugcentral.py` needs an existing snapshot for `--offline`; otherwise consult its PostgreSQL options.
+
+### 3. Merge and preserve supporting events
+
+**Warning: this step regenerates/replaces final integration outputs. Skip it when merely inspecting the validated frozen files.**
 
 ```bash
-python Analysis_00_MergeDatabases.py
+python Analysis_00_MergeDatabases.py --processed-dir data/processed
 ```
 
-Generate source-level composition and overlap summaries:
+The merger validates eleven source inputs, writes the complete harmonised event ledger, constructs source-specific assertion and exact-identity pair views, and generates the manifest with counts and SHA-256 checksums. By default it expects the locked source counts; `--allow-count-drift` exists for deliberate exploratory runs and **must not** be used to claim reproduction of the published dataset.
+
+### 4. Independently audit the merger
 
 ```bash
-python Analysis_01_Source_level_dataset_composition.py
+python Analysis_00C_MergeQuality.py \
+  --processed-dir data/processed \
+  --verify-hashes --verify-source-hashes
 ```
 
----
+The auditor checks the available merged layers, source and output checksums, event support, pair identities, and potential semantic conflicts. Use the same Polars version and bucket count as the merger.
 
-## Output files
+### 5. Run the technical-validation analyses
 
-The main outputs are generated in the processed data directory.
+Run from the repository root after the merged files and manifest exist:
 
-| Output                                                   | Description                                                                                                          |
-| -------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
-| `ALL_INCLUDED_SOURCES_drug_disease_merged.csv`           | Raw merged source-level dataset containing all harmonised records before schema-record deduplication.                |
-| `ALL_INCLUDED_SOURCES_drug_disease_deduplicated.csv`     | Source-level schema-record deduplicated dataset.                                                                     |
-| `ALL_INCLUDED_SOURCES_drug_disease_source_collapsed.csv` | Source-collapsed representation aggregating records sharing the same schema-level drug and disease/condition fields. |
-| `pairwise_drug_disease_pair_overlap_heatmap.png`         | Pairwise source overlap heatmap based on normalised drug–disease name pairs.                                         |
+```bash
+# S1–S7: source composition, relationships, overlap and name/identifier QC
+python Analysis_01_Source_level_dataset_composition.py --save-tables
+python Analysis_02_Evidence_type_distribution.py --save-tables
+python Analysis_03_Relationship_type_distribution.py --save-tables
+python Analysis_04_Unique_drug_coverage.py --save-tables
+python Analysis_08_Cross_source_drug_disease_pair_overlap.py --save-tables
+python Analysis_09_Cross_source_drug_disease_pair_ovelap_diagram.py
+python Analysis_11_Drug_disease_identifier_completeness.py --save-tables
+python Analysis_13_Excluded_source_analysis.py --save-tables
 
----
+# S8–S10: worked example, comparator analysis, and selected indications
+python Analysis_18_Worked_example_type2_diabetes_indication_use_case.py --save-tables
+python Analysis_19_Benchmark_against_PrimeKG_Hetionet.py --save-tables
+python Analysis_20_Positive_control_approved_indication_sanity_check.py --save-tables
 
-## Important limitations
+# S11: build the FDA Orange Book ingredient reference, then evaluate coverage
+python Analysis_23_WHO_EML_or_Approved_Drug_Coverage_make_reference.py \
+  --products EOBZIP_2026_04.zip
+python Analysis_23_WHO_EML_or_Approved_Drug_Coverage.py --save-tables
+```
 
-This dataset is a source-aware biomedical relationship resource. It is not a manually validated list of approved therapeutic indications.
+**Use the exact filenames as committed.** Some module docstrings refer to older filenames; the commands above use the current repository filenames. `Analysis_22_Ontology_normalised_cross_source_overlap.py` is an empty local placeholder in the inspected working directory, not a completed analytical step.
 
-Important interpretation notes:
+### 6. Review figures and tables
 
-* AACT records represent clinical trial intervention–condition co-occurrence, not trial success or drug approval.
-* CTD records represent chemical–disease associations and may include toxicological, inferred, or non-therapeutic relationships.
-* Knowledge-graph sources such as Hetionet and PrimeKG should be interpreted as graph-derived relationships.
-* DrugCentral, PrimeKG, and repoDB include relationship types such as contraindication, off-label use, failed indication, or discontinued indication.
-* Normalised-name matching does not fully resolve drug synonyms, brand names, salt forms, stereochemistry, disease synonyms, or ontology hierarchy.
-* Each source has its own licence and reuse conditions. Users should verify terms before redistribution or commercial use.
+The analysis scripts optionally write summary CSVs into `tables/` and the heatmap generator writes outputs into `figures/`. Its principal names are:
 
----
+```text
+figures/pairwise_drug_disease_pair_overlap_heatmap.png
+figures/pairwise_drug_disease_pair_overlap_heatmap.pdf
+tables/pairwise_drug_disease_pair_overlap_heatmap.csv
+```
 
-## Dataset citation
+Off-diagonal heatmap entries are **shared conservatively normalised drug–disease name-pair counts and pairwise Jaccard similarity**, not conditional row-overlap percentages. Before publishing figures, confirm they were regenerated from the same locked event/assertion snapshot, and commit the final matching figure assets separately if absent from GitHub.
+
+## Analysis scripts
+
+| Script | Purpose |
+|---|---|
+| `Analysis_0.1_InspectFiles.py` | Inspect source and processed files |
+| `Analysis_00_MergeDatabases.py` | Eleven-source integration, event ledger, assertion and pair generation |
+| `Analysis_00C_MergeQuality.py` | Independent merger validation and hash integrity |
+| `Analysis_01_Source_level_dataset_composition.py` | Source composition, counts, names, evidence support |
+| `Analysis_02_Evidence_type_distribution.py` | Original evidence labels and analytical evidence families |
+| `Analysis_03_Relationship_type_distribution.py` | Original relationship types and related summaries |
+| `Analysis_04_Unique_drug_coverage.py` | Name-level drug, disease, and pair coverage |
+| `Analysis_08_Cross_source_drug_disease_pair_overlap.py` | Source support and pairwise lexical overlap |
+| `Analysis_09_Cross_source_drug_disease_pair_ovelap_diagram.py` | Heatmap and pairwise Jaccard visualisation |
+| `Analysis_11_Drug_disease_identifier_completeness.py` | Identifier availability, namespace and mapping ambiguity |
+| `Analysis_13_Excluded_source_analysis.py` | Source manifest, schema and name-quality checks |
+| `Analysis_18_Worked_example_type2_diabetes_indication_use_case.py` | Type 2 diabetes retrieval example |
+| `Analysis_19_Benchmark_against_PrimeKG_Hetionet.py` | Comparisons with PrimeKG and Hetionet |
+| `Analysis_20_Positive_control_approved_indication_sanity_check.py` | Selected indication recovery controls |
+| `Analysis_23_WHO_EML_or_Approved_Drug_Coverage_make_reference.py` | FDA Orange Book single-ingredient RX/OTC reference construction |
+| `Analysis_23_WHO_EML_or_Approved_Drug_Coverage.py` | External reference drug-name coverage analysis |
+
+The `analysiscode/` directory also holds source-oriented exploratory analyses. Not every script is required to generate the locked eleven-source dataset.
+
+## Technical validation
+
+The accompanying manuscript and supplementary analyses describe the following **completed analyses on the validated local snapshot**:
+
+- **Event conservation:** 10,895,395 source events reconcile to 4,534,385 source-specific assertions with preserved supporting-event counts.
+- **Integrity:** all **11 processed merger inputs** and **23 identified raw/snapshot files** passed comparison against recorded SHA-256 hashes.
+- **Source relationships:** 18 original relationship types, 28 original evidence types, 14 broader analytical evidence families; labels are not interchangeable.
+- **Identifier and name auditing:** source identifier namespaces, name multiplicity, identifier-shaped placeholders, and potential mapping conflicts were assessed without asserting global entity resolution.
+- **Duplicate multiplicity and joins:** CTD retained inferred-gene source records; an AACT join-cardinality check covered **202,623 trials** with **0 mismatches** in the evaluated 688,745 intervention–condition combinations.
+- **Source overlap:** **83,878** conservatively normalised name pairs occurred across at least two included databases; this is lexical recurrence, not independent confirmation.
+- **Positive-control retrieval:** **20 of 20** selected known indication examples had at least one strict indication-oriented evidence event. This is a selected sanity check, **not** a population-level precision, specificity, or approval estimate.
+- **FDA Orange Book active-ingredient-name coverage:** **1,467 / 1,543 (95.075%)** single-active-ingredient RX/OTC reference names were strictly matched. An additional **25** formulation-review cases and **51** unmatched names were not counted as covered; this is **name coverage**, not indication-specific validation.
+
+Further external negative controls, manual semantic-adjudication precision estimates, and regulatory-status verification would provide stronger independent accuracy evidence; they are **not claimed as completed** by the analyses listed above.
+
+## Licensing and redistribution
+
+The repository [`LICENSE`](LICENSE) applies the **MIT licence to project-created source code**, not automatically to records obtained or derived from third-party biomedical sources. Public downloads do **not** by themselves confer permission to republish the integrated database under MIT, CC0, or another unrestricted data licence.
+
+The following table reports the licensing statements and concerns documented in the **supplementary source-licensing assessment**. **This is an attribution/reuse summary, not a legal clearance opinion.** Verify the current provider terms and constituent-data rights for the actual release before distribution.
+
+| Data source | Reported terms / licence | Conditions to check before redistributing integrated records |
+|---|---|---|
+| AACT / ClinicalTrials.gov | Public trial data; no blanket redistribution licence established for complete derivative compilation | Cite ClinicalTrials.gov/AACT; confirm constituent-data reuse rights |
+| Broad Drug Repurposing Hub | CC BY 4.0 for published compound annotations; separate portal restrictions may apply | Attribution; commercial-use and redistribution scope |
+| ChEMBL | **CC BY-SA 3.0 Unported** | Attribution and ShareAlike requirements for derived content |
+| CTD | Source-specific data-use requirements | Attribution, linking, notification, redistribution authority; commercial terms |
+| DrugCentral | **CC BY-SA 4.0** reported | Attribution and ShareAlike conditions |
+| Hetionet | Original content reported as **CC0** | Check upstream-derived data and preserve relevant source citations |
+| MEDI | **CC BY-NC-SA 3.0 Unported** | NonCommercial and ShareAlike obligations; review licence compatibility |
+| Open Targets | Platform-level **CC0**, with third-party rights reservations | Confirm contributing-provider conditions |
+| PrimeKG | Harvard Dataverse dataset reported **CC0 1.0** | Review underlying graph input/terminology rights and cite dataset |
+| repoDB | **CC BY 4.0** reported | Attribution; review embedded DrugBank/UMLS and trial-derived rights |
+| SIDER | **CC BY-SA 4.0** reported for indication data | Attribution, ShareAlike and underlying terminology rights |
+
+**Required before final Version 2 deposit:** finalise the source/licence matrix; preserve source-specific acknowledgements and attribution; obtain institutional rights review or source-owner permission when terms are ambiguous or incompatible; and, if needed, split, omit, or distribute restricted components through an authorised mechanism. **The MIT software licence must not be represented as licensing the entire integrated dataset.**
+
+## Data availability and release provenance
+
+- **Project code:** [GitHub](https://github.com/MuhammadMuneeb007/drug-disease-mapping)
+- **Existing project data record:** [Zenodo DOI 10.5281/zenodo.18308460](https://doi.org/10.5281/zenodo.18308460)
+- **Validated 11-source Version 2 DOI:** **to be inserted after deposit and verification**
+- **Version 2 code release/tag:** **to be recorded after code and working tree are frozen**
+- **Version 2 file inventory / published archive SHA-256:** **to be inserted after verification**
+
+The source audit records an extraction/integration time and checksums, including the 24 October 2026 DrugCentral snapshot, but a source file's modification time is **not proof of its download date**. The audit checkout hash is **not automatically the final release hash**. A reproducible deposition should record the exact Git commit, Polars and Python versions, source version identifiers, input/output checksums, scripts and execution arguments, included sources, and any unresolved licensing restrictions.
+
+The validated outputs are large; **do not commit raw database archives or multi-gigabyte integrated CSVs to the Git repository**. Deposit authorised data with checksums to a suitable data repository and link the matching version here. The current Version 2 statistics must not be attributed to an older archive until that archive is confirmed to contain exactly the same records.
+
+## Citation and acknowledgements
+
+### Cite this project
+
+The manuscript is authored by **Muhammad Muneeb and David B. Ascher**:
+
+> Muneeb, M. & Ascher, D. B. *A source-aware drug–disease relationship dataset integrating public biomedical resources*. Manuscript in preparation (2026). **Update with journal/DOI after publication.**
+
+For dataset use, cite the **specific Zenodo version actually used**. The existing project record is:
 
 ```bibtex
 @dataset{muneeb_drug_disease_2026,
@@ -373,79 +352,29 @@ Important interpretation notes:
 }
 ```
 
----
+### Cite the original resources
 
-## Source citations
+Using the integrated records also requires citing the relevant upstream data resources, their versions, and applicable licences. Key source publications include:
 
-Please cite the original sources where relevant.
+- **AACT:** Tasneem et al. (2012), *PLoS ONE*. [DOI: 10.1371/journal.pone.0033677](https://doi.org/10.1371/journal.pone.0033677)
+- **ChEMBL:** Zdrazil et al. (2024), *Nucleic Acids Research*. [DOI: 10.1093/nar/gkad1004](https://doi.org/10.1093/nar/gkad1004)
+- **CTD:** Davis et al., *Nucleic Acids Research*, 2025 update. [DOI: 10.1093/nar/gkae883](https://doi.org/10.1093/nar/gkae883)
+- **DrugCentral:** Avram et al. (2023), *Nucleic Acids Research*. [DOI: 10.1093/nar/gkac1085](https://doi.org/10.1093/nar/gkac1085)
+- **Hetionet:** Himmelstein et al. (2017), *eLife*. [DOI: 10.7554/eLife.26726](https://doi.org/10.7554/eLife.26726)
+- **MEDI:** Wei et al. (2013), *Journal of the American Medical Informatics Association*. [DOI: 10.1136/amiajnl-2012-001431](https://doi.org/10.1136/amiajnl-2012-001431)
+- **Open Targets:** Buniello et al. (2025), *Nucleic Acids Research*. [DOI: 10.1093/nar/gkae1128](https://doi.org/10.1093/nar/gkae1128)
+- **PrimeKG:** Chandak, Huang & Zitnik (2023), *Scientific Data*. [DOI: 10.1038/s41597-023-01960-3](https://doi.org/10.1038/s41597-023-01960-3)
+- **repoDB:** Brown & Patel (2017), *Scientific Data*. [DOI: 10.1038/sdata.2017.29](https://doi.org/10.1038/sdata.2017.29)
+- **SIDER:** Kuhn et al. (2016), *Nucleic Acids Research*. [DOI: 10.1093/nar/gkv1075](https://doi.org/10.1093/nar/gkv1075)
+- **Broad Drug Repurposing Hub:** Corsello et al. (2017), *Nature Medicine*. [DOI: 10.1038/nm.4306](https://doi.org/10.1038/nm.4306)
 
-```bibtex
-@article{hetionet2017,
-  title   = {Systematic integration of biomedical knowledge prioritizes drugs for repurposing},
-  journal = {eLife},
-  year    = {2017},
-  doi     = {10.7554/eLife.26726}
-}
-
-@article{repodb2017,
-  title   = {repoDB: a standard database for drug repositioning},
-  journal = {Scientific Data},
-  year    = {2017},
-  doi     = {10.1038/sdata.2017.29}
-}
-
-@article{broad_repurposing_hub2017,
-  title   = {An interactive resource to identify cancer genetic and lineage dependencies targeted by small molecules},
-  journal = {Nature Medicine},
-  year    = {2017},
-  doi     = {10.1038/nm.4306}
-}
-
-@article{medi2013,
-  title   = {Development and evaluation of an ensemble resource linking medications to their indications},
-  journal = {Journal of the American Medical Informatics Association},
-  year    = {2013},
-  doi     = {10.1136/amiajnl-2012-001431}
-}
-
-@article{primekg2023,
-  title   = {Building a knowledge graph to enable precision medicine},
-  journal = {Scientific Data},
-  year    = {2023},
-  doi     = {10.1038/s41597-023-01960-3}
-}
-
-@article{chembl2024,
-  title   = {ChEMBL: towards direct deposition of bioassay data},
-  journal = {Nucleic Acids Research},
-  year    = {2024},
-  doi     = {10.1093/nar/gkad1004}
-}
-
-@article{ctd2025,
-  title   = {The Comparative Toxicogenomics Database},
-  journal = {Nucleic Acids Research},
-  year    = {2025},
-  doi     = {10.1093/nar/gkae883}
-}
-
-@article{drugcentral2023,
-  title   = {DrugCentral 2023 extends human clinical data and integrates veterinary drugs},
-  journal = {Nucleic Acids Research},
-  year    = {2023},
-  doi     = {10.1093/nar/gkac1085}
-}
-```
-
----
+**Acknowledgements:** The creators and maintainers of the included biomedical resources, contributing clinical-trial registries, terminology projects, and open-source processing libraries are acknowledged.  
 
 ## Contact
 
-**Muhammad Muneeb**
+**Muhammad Muneeb** — research and pipeline lead  
+Email: [m.muneeb@uq.edu.au](mailto:m.muneeb@uq.edu.au)  
+GitHub: [MuhammadMuneeb007](https://github.com/MuhammadMuneeb007)  
+Repository: [drug-disease-mapping](https://github.com/MuhammadMuneeb007/drug-disease-mapping)
 
-* Email: [muneebsiddique007@gmail.com](mailto:muneebsiddique007@gmail.com)
-* Email: [m.muneeb@uq.edu.au](mailto:m.muneeb@uq.edu.au)
-* GitHub: [https://github.com/MuhammadMuneeb007](https://github.com/MuhammadMuneeb007)
-* Repository: [https://github.com/MuhammadMuneeb007/drug-disease-mapping](https://github.com/MuhammadMuneeb007/drug-disease-mapping)
-
- 
+For issues involving incorrect evidence interpretation, provenance, incompatible source licences, or potential integration errors, open a [GitHub issue](https://github.com/MuhammadMuneeb007/drug-disease-mapping/issues) with the source record and script details,  
