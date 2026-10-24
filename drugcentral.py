@@ -1,89 +1,38 @@
+
 #!/usr/bin/env python3
+"""DrugCentral PostgreSQL -> frozen raw snapshot -> merge-compatible evidence.
+
+First run downloads a query-selected snapshot from the public DrugCentral database.
+Later runs reuse that snapshot. Pass --refresh-source to fetch again, or --offline
+for an explicitly network-free run. No existing processed files are deleted early.
+
+Indications, contraindications and off-label uses are NOT interchangeable.
+This is a source-evidence table, not an ontology-resolved/independent-efficacy table.
 """
-DrugCentral PostgreSQL -> unified drug-disease association CSV
-
-Purpose
--------
-Extract DrugCentral drug-condition relationships into a publication-ready,
-provenance-aware CSV for a multi-source drug-disease association dataset.
-
-Source
-------
-DrugCentral public PostgreSQL instance:
-    host:     unmtid-dbs.net
-    port:     5433
-    database: drugcentral
-    user:     drugman
-    password: dosage
-
-DrugCentral download page:
-    https://drugcentral.org/download
-
-Interpretation
---------------
-DrugCentral contains structured drug clinical relationships such as
-indications, contraindications, off-label uses, treatment relationships,
-and related OMOP/SNOMED concept mappings depending on the database version.
-
-These records should be interpreted according to the original relationship
-field. Do not force all DrugCentral rows to approved indications.
-
-Unified output columns
-----------------------
-drug_name
-drug_identifier
-drug_identifier_type
-disease_or_condition_name
-disease_or_condition_identifier
-disease_or_condition_identifier_type
-relationship_type
-evidence_type
-source
-internal_source
-
-DrugCentral-specific metadata columns
--------------------------------------
-drugcentral_struct_id
-drugcentral_relationship
-concept_kind
-source_table
-source_relationship_raw
-
-Requirements
-------------
-pip install psycopg2-binary pandas
-"""
-
 from __future__ import annotations
 
 import argparse
 import csv
 import hashlib
 import json
+import os
+import re
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 
-import pandas as pd
-import psycopg2
-import psycopg2.extras
+ROOT = Path(os.environ.get(
+    "DRUG_DISEASE_ROOT", Path(__file__).resolve().parent
+)).resolve()
 
+RAW_DIR = ROOT / "data/raw/drugcentral"
+OUT_DIR = ROOT / "data/processed"
+META_DIR = ROOT / "data/metadata"
 
-# ============================================================
-# CONFIG
-# ============================================================
+RAW_NAME = "drugcentral_omop_relationship_snapshot.csv"
+MANIFEST_NAME = "drugcentral_omop_relationship_snapshot.json"
 
-DEFAULT_HOST = "unmtid-dbs.net"
-DEFAULT_PORT = 5433
-DEFAULT_DBNAME = "drugcentral"
-DEFAULT_USER = "drugman"
-DEFAULT_PASSWORD = "dosage"
-
-DRUGCENTRAL_DOWNLOAD_PAGE = "https://drugcentral.org/download"
-DRUGCENTRAL_DUMP_URL = "https://unmtid-dbs.net/download/drugcentral.dump.11012023.sql.gz"
-
-OUTPUT_COLUMNS = [
-    # Unified schema
+CORE = [
     "drug_name",
     "drug_identifier",
     "drug_identifier_type",
@@ -94,752 +43,1457 @@ OUTPUT_COLUMNS = [
     "evidence_type",
     "source",
     "internal_source",
+]
 
-    # DrugCentral-specific metadata
+EXTRA = [
     "drugcentral_struct_id",
     "drugcentral_relationship",
     "concept_kind",
     "source_table",
     "source_relationship_raw",
+    "relationship_category",
+    "drugcentral_record_id",
+    "drugcentral_source_row_number",
+    "disease_identifier_source_column",
+    "snomed_conceptid",
+    "umls_cui",
+    "omop_concept_id",
+    "concept_name",
+    "snomed_full_name",
+    "drug_name_lookup_status",
+    "disease_name_lookup_status",
+    "evidence_granularity",
 ]
 
+for entity in ("drug", "disease"):
+    EXTRA += [
+        f"{entity}_identifier_{s}"
+        for s in (
+            "original",
+            "namespace",
+            "canonical",
+            "validation",
+        )
+    ]
 
-# ============================================================
-# HELPERS
-# ============================================================
+COLUMNS = CORE + EXTRA
 
-def now_utc() -> str:
+RAW_COLUMNS = [
+    "drugcentral_source_row_number",
+    "drugcentral_record_id",
+    "drugcentral_struct_id",
+    "drug_name",
+    "snomed_conceptid",
+    "umls_cui",
+    "omop_concept_id",
+    "concept_name",
+    "snomed_full_name",
+    "disease_or_condition_name",
+    "source_relationship_raw",
+    "concept_kind",
+    "source_table",
+]
+
+REJECT_COLS = [
+    "source_row_number",
+    "source_record_id",
+    "reason",
+    "raw_record_json",
+]
+
+DEDUP_EXTRA = [
+    "drugcentral_supporting_record_count",
+    "drugcentral_supporting_source_rows",
+]
+
+RELATIONS = {
+    "indication": (
+        "indication",
+        "drugcentral_indication",
+    ),
+    "contraindication": (
+        "contraindication",
+        "drugcentral_contraindication",
+    ),
+    "off_label_use": (
+        "off_label_use",
+        "drugcentral_off_label_use",
+    ),
+    "symptomatic_treatment": (
+        "symptomatic_treatment",
+        "drugcentral_symptomatic_treatment",
+    ),
+    "reduce_risk": (
+        "risk_reduction",
+        "drugcentral_risk_reduction",
+    ),
+    "diagnosis": (
+        "diagnostic_use",
+        "drugcentral_diagnostic_use",
+    ),
+}
+
+
+def now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def print_section(title: str) -> None:
-    print("\n" + "=" * 100)
-    print(title)
-    print("=" * 100)
+def heading(label):
+    print(
+        "\n" + "=" * 84
+        + "\n" + label
+        + "\n" + "=" * 84,
+        flush=True,
+    )
 
 
-def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+def clean(x):
+    return "" if x is None else str(x).strip()
+
+
+def digest(path):
     h = hashlib.sha256()
 
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(chunk_size), b""):
-            h.update(chunk)
+    with Path(path).open("rb") as f:
+        for b in iter(
+            lambda: f.read(4 * 1024 * 1024),
+            b"",
+        ):
+            h.update(b)
 
     return h.hexdigest()
 
 
-def clean_text(x) -> str:
-    if x is None:
-        return ""
-    return str(x).strip()
-
-
-def pg_table_exists(cur, table: str, schema: str = "public") -> bool:
-    cur.execute(
-        """
-        SELECT 1
-        FROM information_schema.tables
-        WHERE table_schema = %s
-        AND table_name = %s
-        LIMIT 1
-        """,
-        (schema, table),
+def stage_json(path, content):
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
     )
-    return cur.fetchone() is not None
 
-
-def pg_columns(cur, table: str, schema: str = "public") -> list[str]:
-    cur.execute(
-        """
-        SELECT column_name
-        FROM information_schema.columns
-        WHERE table_schema = %s
-        AND table_name = %s
-        ORDER BY ordinal_position
-        """,
-        (schema, table),
+    tmp = path.with_name(
+        path.name + ".processing.tmp"
     )
-    return [r[0] for r in cur.fetchall()]
+
+    tmp.write_text(
+        json.dumps(
+            content,
+            indent=2,
+            ensure_ascii=False,
+            default=str,
+        ) + "\n",
+        encoding="utf-8",
+    )
+
+    return tmp
 
 
-def pick_first_present(columns: list[str], *candidates: str) -> Optional[str]:
-    available = set(columns)
+def identifier(raw, namespace):
+    original = clean(raw)
 
-    for c in candidates:
-        if c in available:
-            return c
+    if not original:
+        return original, namespace or "", "", "missing"
 
-    return None
+    v = original.upper()
 
-
-def infer_disease_identifier_type(identifier: str) -> str:
-    x = clean_text(identifier)
-
-    if not x:
-        return ""
-
-    upper = x.upper()
-
-    if upper.startswith("SNOMED"):
-        return "SNOMED"
-
-    if upper.startswith("MESH"):
-        return "MeSH"
-
-    if upper.startswith("OMOP"):
-        return "OMOP"
-
-    if upper.startswith("UMLS"):
-        return "UMLS"
-
-    # Most DrugCentral omop_relationship concept IDs are numeric SNOMED/OMOP-like IDs.
-    if x.isdigit():
-        return "SNOMED/OMOP"
-
-    return "DrugCentral_concept"
-
-
-def normalise_relationship_type(raw_relationship: str) -> str:
-    """
-    Preserve the source meaning but make the relationship_type machine-friendly.
-
-    Examples:
-        indication -> indication
-        contraindication -> contraindication
-        off-label use -> off_label_use
-    """
-    r = clean_text(raw_relationship).lower()
-
-    if not r:
-        return "drug_condition_relationship"
-
-    r = r.replace("-", " ")
-    r = r.replace("/", " ")
-    r = "_".join(r.split())
-
-    return r
-
-
-def choose_evidence_type(raw_relationship: str) -> str:
-    """
-    Keep DrugCentral relationship evidence as DrugCentral-derived clinical annotation.
-    """
-    r = normalise_relationship_type(raw_relationship)
-
-    if "contraindication" in r:
-        return "drugcentral_contraindication"
-
-    if "off" in r and "label" in r:
-        return "drugcentral_off_label_use"
-
-    if "indication" in r:
-        return "drugcentral_indication"
-
-    if "treatment" in r or "treat" in r:
-        return "drugcentral_treatment"
-
-    return "drugcentral_clinical_relationship"
-
-
-# ============================================================
-# DATABASE DISCOVERY
-# ============================================================
-
-def discover_drug_table(cur) -> tuple[Optional[str], Optional[str], Optional[str]]:
-    """
-    Find a DrugCentral drug table and join fields.
-
-    Returns:
-        table_name, id_column, name_column
-    """
-    candidates = ["structures", "drug", "drugs"]
-
-    for table in candidates:
-        if not pg_table_exists(cur, table):
-            continue
-
-        cols = pg_columns(cur, table)
-
-        id_col = pick_first_present(
-            cols,
-            "id",
-            "struct_id",
-            "drug_id",
+    if namespace == "DrugCentral":
+        good = bool(
+            re.fullmatch(r"\d+", v)
         )
 
-        name_col = pick_first_present(
-            cols,
-            "name",
-            "drug_name",
-            "inn",
-            "preferred_name",
+        return (
+            original,
+            namespace,
+            "DRUGCENTRAL:" + v if good else "",
+            "syntax_valid" if good else "invalid_syntax",
         )
 
-        if id_col and name_col:
-            return table, id_col, name_col
+    if namespace == "SNOMEDCT":
+        good = bool(
+            re.fullmatch(r"\d{6,18}", v)
+        )
 
-    return None, None, None
+        return (
+            original,
+            namespace,
+            "SNOMEDCT:" + v if good else "",
+            "syntax_valid" if good else "invalid_syntax",
+        )
 
+    if namespace == "UMLS":
+        good = bool(
+            re.fullmatch(
+                r"(?:UMLS:)?C\d{7}",
+                v,
+            )
+        )
 
-def inspect_database(cur, head_n: int = 5) -> dict:
-    print_section("Inspecting DrugCentral database")
+        return (
+            original,
+            namespace,
+            "UMLS:" + v.removeprefix("UMLS:") if good else "",
+            "syntax_valid" if good else "invalid_syntax",
+        )
 
-    cur.execute(
-        """
-        SELECT table_name
-        FROM information_schema.tables
-        WHERE table_schema = 'public'
-        ORDER BY table_name
-        """
+    if namespace == "OMOP":
+        good = bool(
+            re.fullmatch(r"\d+", v)
+        )
+
+        return (
+            original,
+            namespace,
+            "OMOP:" + v if good else "",
+            "syntax_valid" if good else "invalid_syntax",
+        )
+
+    return (
+        original,
+        namespace or "unresolved",
+        "",
+        "unrecognised_namespace",
     )
 
-    tables = [r[0] for r in cur.fetchall()]
 
-    print(f"[TABLE COUNT] {len(tables):,}")
-    print("[FIRST 80 TABLES]")
-    for t in tables[:80]:
-        print(f"  - {t}")
+def relationship(raw):
+    token = re.sub(
+        r"[^a-z0-9]+",
+        "_",
+        clean(raw).casefold(),
+    ).strip("_")
 
-    inspected = {}
-
-    for table in ["omop_relationship", "structures", "drug", "drugs", "indication", "indications"]:
-        if not pg_table_exists(cur, table):
-            continue
-
-        cols = pg_columns(cur, table)
-
-        cur.execute(f'SELECT COUNT(*) FROM "{table}"')
-        n = cur.fetchone()[0]
-
-        print()
-        print("-" * 100)
-        print(f"[TABLE] {table}")
-        print(f"[ROWS] {n:,}")
-        print(f"[COLUMNS] {cols}")
-
-        try:
-            cur.execute(f'SELECT * FROM "{table}" LIMIT %s', (head_n,))
-            rows = cur.fetchall()
-            colnames = [desc[0] for desc in cur.description]
-            head = [dict(zip(colnames, row)) for row in rows]
-        except Exception:
-            head = []
-
-        inspected[table] = {
-            "rows": int(n),
-            "columns": cols,
-            "head_preview": head,
-        }
-
-    drug_table, drug_id_col, drug_name_col = discover_drug_table(cur)
-
-    print()
-    print("[DRUG TABLE DISCOVERY]")
-    print(f"  table:     {drug_table}")
-    print(f"  id_col:    {drug_id_col}")
-    print(f"  name_col:  {drug_name_col}")
-
-    return {
-        "table_count": len(tables),
-        "tables_preview": tables[:100],
-        "inspected_tables": inspected,
-        "drug_table_discovery": {
-            "table": drug_table,
-            "id_col": drug_id_col,
-            "name_col": drug_name_col,
-        },
-    }
-
-
-# ============================================================
-# QUERY BUILDERS
-# ============================================================
-
-def build_query_from_omop_relationship(cur) -> Optional[tuple[str, str]]:
-    """
-    Best route: use omop_relationship.
-
-    We join to structures/drug/drugs to fill drug_name.
-    """
-    if not pg_table_exists(cur, "omop_relationship"):
-        return None
-
-    r_cols = pg_columns(cur, "omop_relationship")
-
-    struct_id = pick_first_present(
-        r_cols,
-        "struct_id",
-        "drug_id",
-        "id",
+    rel, ev = RELATIONS.get(
+        token,
+        (
+            "unclassified_drug_condition_relationship",
+            "drugcentral_unclassified_relationship",
+        ),
     )
 
-    rel = pick_first_present(
-        r_cols,
-        "relationship_name",
-        "relationship",
+    return rel, ev, token or "missing"
+
+
+def from_raw(row):
+    drug_id = clean(
+        row["drugcentral_struct_id"]
     )
 
-    disease_id = pick_first_present(
-        r_cols,
-        "snomed_conceptid",
-        "concept_id",
-        "snomed_id",
-        "disease_id",
-        "umls_cui",
+    drug_name = clean(
+        row["drug_name"]
     )
 
-    disease_name = pick_first_present(
-        r_cols,
-        "snomed_full_name",
-        "concept_name",
-        "disease_name",
-    )
+    if drug_name:
+        drug_lookup = "structures_name"
 
-    concept_kind = pick_first_present(
-        r_cols,
-        "concept_class",
-        "concept_type",
-        "domain_id",
-        "vocabulary_id",
-    )
+    elif drug_id:
+        drug_name = drug_id
+        drug_lookup = "struct_id_placeholder"
 
-    if not (struct_id and disease_name):
-        return None
+    else:
+        drug_lookup = "missing_drug_identity"
 
-    drug_table, drug_id_col, drug_name_col = discover_drug_table(cur)
-
-    join = ""
-    drug_name_expr = "''"
-
-    if drug_table and drug_id_col and drug_name_col:
-        join = f'LEFT JOIN "{drug_table}" d ON r."{struct_id}" = d."{drug_id_col}"'
-        drug_name_expr = f'COALESCE(d."{drug_name_col}", \'\')'
-
-    disease_id_expr = f'CAST(r."{disease_id}" AS TEXT)' if disease_id else "''"
-    relationship_expr = f'COALESCE(CAST(r."{rel}" AS TEXT), \'\')' if rel else "''"
-    concept_kind_expr = f'COALESCE(CAST(r."{concept_kind}" AS TEXT), \'\')' if concept_kind else "''"
-
-    sql = f"""
-        SELECT
-            CAST(r."{struct_id}" AS TEXT) AS drugcentral_struct_id,
-            {drug_name_expr} AS drug_name,
-            {disease_id_expr} AS disease_or_condition_identifier,
-            COALESCE(CAST(r."{disease_name}" AS TEXT), '') AS disease_or_condition_name,
-            {relationship_expr} AS source_relationship_raw,
-            {concept_kind_expr} AS concept_kind,
-            'omop_relationship' AS source_table
-        FROM omop_relationship r
-        {join}
-        WHERE r."{disease_name}" IS NOT NULL
-        AND TRIM(CAST(r."{disease_name}" AS TEXT)) <> ''
-    """
-
-    return sql, "omop_relationship"
-
-
-def build_query_from_indication_table(cur) -> Optional[tuple[str, str]]:
-    """
-    Fallback route if omop_relationship is not available.
-    """
-    candidates = [
-        "indication",
-        "indications",
-        "drug_indication",
-        "drug_indications",
-        "use",
-        "uses",
+    ids = [
+        ("snomed_conceptid", "SNOMEDCT"),
+        ("umls_cui", "UMLS"),
+        ("omop_concept_id", "OMOP"),
     ]
 
-    drug_table, drug_id_col, drug_name_col = discover_drug_table(cur)
+    disease_id = ""
+    disease_ns = ""
+    id_col = ""
 
-    for table in candidates:
-        if not pg_table_exists(cur, table):
-            continue
+    for col, namespace in ids:
+        if clean(row[col]):
+            disease_id = clean(row[col])
+            disease_ns = namespace
+            id_col = col
+            break
 
-        cols = pg_columns(cur, table)
+    disease_name = clean(
+        row["disease_or_condition_name"]
+    )
 
-        struct_id = pick_first_present(
-            cols,
-            "struct_id",
-            "drug_id",
-            "structure_id",
-            "id",
+    if disease_name:
+        disease_lookup = "source_concept_name"
+
+    elif disease_id:
+        disease_name = disease_id
+        disease_lookup = "identifier_placeholder"
+
+    else:
+        disease_lookup = "missing_disease_identity"
+
+    reasons = []
+
+    if not drug_id:
+        reasons.append("missing_struct_id")
+
+    if not disease_name:
+        reasons.append(
+            "missing_disease_name_and_identifier"
         )
 
-        disease_name = pick_first_present(
-            cols,
-            "concept_name",
-            "disease_name",
-            "indication",
-            "name",
-        )
+    if reasons:
+        return None, "|".join(reasons)
 
-        disease_id = pick_first_present(
-            cols,
-            "omop_concept_id",
-            "concept_id",
-            "snomed_conceptid",
-            "mesh_id",
-            "efo_id",
-            "umls_cui",
-        )
-
-        rel = pick_first_present(
-            cols,
-            "relationship_name",
-            "relationship",
-            "type",
-        )
-
-        if not (struct_id and disease_name):
-            continue
-
-        join = ""
-        drug_name_expr = "''"
-
-        if drug_table and drug_id_col and drug_name_col:
-            join = f'LEFT JOIN "{drug_table}" d ON i."{struct_id}" = d."{drug_id_col}"'
-            drug_name_expr = f'COALESCE(d."{drug_name_col}", \'\')'
-
-        disease_id_expr = f'CAST(i."{disease_id}" AS TEXT)' if disease_id else "''"
-        relationship_expr = f'COALESCE(CAST(i."{rel}" AS TEXT), \'indication\')' if rel else "'indication'"
-
-        sql = f"""
-            SELECT
-                CAST(i."{struct_id}" AS TEXT) AS drugcentral_struct_id,
-                {drug_name_expr} AS drug_name,
-                {disease_id_expr} AS disease_or_condition_identifier,
-                COALESCE(CAST(i."{disease_name}" AS TEXT), '') AS disease_or_condition_name,
-                {relationship_expr} AS source_relationship_raw,
-                '' AS concept_kind,
-                '{table}' AS source_table
-            FROM "{table}" i
-            {join}
-            WHERE i."{disease_name}" IS NOT NULL
-            AND TRIM(CAST(i."{disease_name}" AS TEXT)) <> ''
-        """
-
-        return sql, table
-
-    return None
-
-
-def choose_sql(cur) -> tuple[str, str]:
-    route = build_query_from_omop_relationship(cur)
-
-    if route is not None:
-        return route
-
-    route = build_query_from_indication_table(cur)
-
-    if route is not None:
-        return route
-
-    cur.execute(
-        """
-        SELECT table_name
-        FROM information_schema.tables
-        WHERE table_schema = 'public'
-        ORDER BY table_name
-        """
+    rel, evidence, normalized = relationship(
+        row["source_relationship_raw"]
     )
 
-    tables = [r[0] for r in cur.fetchall()]
-
-    raise RuntimeError(
-        "Could not find usable DrugCentral mapping tables.\n"
-        "First 100 tables:\n"
-        + "\n".join(tables[:100])
+    drug_fields = identifier(
+        drug_id,
+        "DrugCentral",
     )
 
-
-# ============================================================
-# EXPORT
-# ============================================================
-
-def export_to_csv(
-    conn,
-    sql: str,
-    source_table: str,
-    out_csv: Path,
-    fetch_size: int = 100_000,
-) -> dict:
-    print_section("Exporting DrugCentral records")
-
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
-
-    if out_csv.exists():
-        out_csv.unlink()
-
-    n_written = 0
-    n_skipped_no_drug = 0
-    n_skipped_no_disease = 0
-
-    relationship_counts = {}
-    evidence_counts = {}
-    source_table_counts = {}
-
-    with conn.cursor(
-        name="drugcentral_stream",
-        cursor_factory=psycopg2.extras.DictCursor,
-    ) as cur:
-        cur.itersize = fetch_size
-        cur.execute(sql)
-
-        with open(out_csv, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=OUTPUT_COLUMNS)
-            writer.writeheader()
-
-            for row in cur:
-                drugcentral_struct_id = clean_text(row["drugcentral_struct_id"])
-                drug_name = clean_text(row["drug_name"])
-
-                disease_id = clean_text(row["disease_or_condition_identifier"])
-                disease_name = clean_text(row["disease_or_condition_name"])
-
-                source_relationship_raw = clean_text(row["source_relationship_raw"])
-                concept_kind = clean_text(row["concept_kind"])
-                source_table_value = clean_text(row["source_table"]) or source_table
-
-                if not drugcentral_struct_id and not drug_name:
-                    n_skipped_no_drug += 1
-                    continue
-
-                if not disease_name:
-                    n_skipped_no_disease += 1
-                    continue
-
-                relationship_type = normalise_relationship_type(source_relationship_raw)
-                evidence_type = choose_evidence_type(source_relationship_raw)
-
-                disease_identifier_type = infer_disease_identifier_type(disease_id)
-
-                output_row = {
-                    "drug_name": drug_name,
-                    "drug_identifier": drugcentral_struct_id,
-                    "drug_identifier_type": "DrugCentral_struct_id",
-                    "disease_or_condition_name": disease_name,
-                    "disease_or_condition_identifier": disease_id,
-                    "disease_or_condition_identifier_type": disease_identifier_type,
-                    "relationship_type": relationship_type,
-                    "evidence_type": evidence_type,
-                    "source": "DrugCentral",
-                    "internal_source": "DrugCentral PostgreSQL public instance",
-                    "drugcentral_struct_id": drugcentral_struct_id,
-                    "drugcentral_relationship": relationship_type,
-                    "concept_kind": concept_kind,
-                    "source_table": source_table_value,
-                    "source_relationship_raw": source_relationship_raw,
-                }
-
-                writer.writerow(output_row)
-                n_written += 1
-
-                relationship_counts[relationship_type] = relationship_counts.get(relationship_type, 0) + 1
-                evidence_counts[evidence_type] = evidence_counts.get(evidence_type, 0) + 1
-                source_table_counts[source_table_value] = source_table_counts.get(source_table_value, 0) + 1
-
-                if n_written % 100_000 == 0:
-                    print(f"[WRITE] {n_written:,} rows -> {out_csv}")
-
-    if not out_csv.exists() or out_csv.stat().st_size == 0:
-        raise RuntimeError("Output CSV was not created or is empty.")
-
-    print_section("Output validation")
-
-    head = pd.read_csv(out_csv, dtype=str, nrows=10)
-
-    print("[OUTPUT HEAD]")
-    print(head.to_string(index=False))
-
-    full = pd.read_csv(out_csv, dtype=str, low_memory=False).fillna("")
-
-    exact_duplicate_rows = int(full.duplicated().sum())
-
-    unique_drugs = int(full["drug_identifier"].nunique(dropna=True))
-    unique_drug_names = int(full["drug_name"].nunique(dropna=True))
-    unique_diseases = int(full["disease_or_condition_identifier"].nunique(dropna=True))
-    unique_disease_names = int(full["disease_or_condition_name"].nunique(dropna=True))
-
-    unique_pairs = int(
-        full[
-            [
-                "drug_identifier",
-                "disease_or_condition_name",
-                "relationship_type",
-            ]
-        ]
-        .drop_duplicates()
-        .shape[0]
+    disease_fields = identifier(
+        disease_id,
+        disease_ns,
     )
 
-    print()
-    print("[OUTPUT SUMMARY]")
-    print(f"Rows written:              {len(full):,}")
-    print(f"Skipped missing drug:      {n_skipped_no_drug:,}")
-    print(f"Skipped missing disease:   {n_skipped_no_disease:,}")
-    print(f"Exact duplicate rows:      {exact_duplicate_rows:,}")
-    print(f"Unique drug IDs:           {unique_drugs:,}")
-    print(f"Unique drug names:         {unique_drug_names:,}")
-    print(f"Unique disease IDs:        {unique_diseases:,}")
-    print(f"Unique disease names:      {unique_disease_names:,}")
-    print(f"Unique drug-disease-rel pairs: {unique_pairs:,}")
-    print(f"Output SHA256:             {sha256_file(out_csv)}")
+    out = {
+        "drug_name": drug_name,
+        "drug_identifier": drug_id,
+        "drug_identifier_type": "DrugCentral",
 
-    print()
-    print("[RELATIONSHIP TYPE COUNTS]")
-    for k, v in sorted(relationship_counts.items(), key=lambda x: x[1], reverse=True):
-        print(f"  - {k}: {v:,}")
+        "disease_or_condition_name":
+            disease_name,
 
-    return {
-        "output_file": str(out_csv),
-        "output_size_bytes": out_csv.stat().st_size,
-        "output_sha256": sha256_file(out_csv),
-        "rows_written": int(len(full)),
-        "rows_stream_written": int(n_written),
-        "rows_skipped_no_drug": int(n_skipped_no_drug),
-        "rows_skipped_no_disease": int(n_skipped_no_disease),
-        "exact_duplicate_rows": exact_duplicate_rows,
-        "unique_drug_identifiers": unique_drugs,
-        "unique_drug_names": unique_drug_names,
-        "unique_disease_identifiers": unique_diseases,
-        "unique_disease_names": unique_disease_names,
-        "unique_drug_disease_relationship_pairs": unique_pairs,
-        "relationship_type_counts": relationship_counts,
-        "evidence_type_counts": evidence_counts,
-        "source_table_counts": source_table_counts,
-        "output_columns": list(full.columns),
-        "output_head": head.to_dict(orient="records"),
-    }
+        "disease_or_condition_identifier":
+            disease_id,
 
+        "disease_or_condition_identifier_type":
+            disease_ns,
 
-# ============================================================
-# MAIN
-# ============================================================
+        "relationship_type": rel,
+        "evidence_type": evidence,
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Export DrugCentral clinical drug-condition relationships into unified schema."
-    )
-
-    parser.add_argument("--host", default=DEFAULT_HOST)
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
-    parser.add_argument("--user", default=DEFAULT_USER)
-    parser.add_argument("--password", default=DEFAULT_PASSWORD)
-    parser.add_argument("--dbname", default=DEFAULT_DBNAME)
-
-    parser.add_argument(
-        "--out",
-        default="./data/processed/drugcentral_drug_disease.csv",
-        help="Output CSV path.",
-    )
-
-    parser.add_argument(
-        "--metadata",
-        default="./data/metadata/drugcentral_processing_metadata.json",
-        help="Metadata JSON path.",
-    )
-
-    parser.add_argument(
-        "--fetch_size",
-        type=int,
-        default=100_000,
-        help="Server-side cursor fetch size.",
-    )
-
-    parser.add_argument(
-        "--head_n",
-        type=int,
-        default=5,
-        help="Number of rows to preview during inspection.",
-    )
-
-    args = parser.parse_args()
-
-    out_csv = Path(args.out).resolve()
-    metadata_path = Path(args.metadata).resolve()
-
-    metadata = {
-        "script": "drugcentral.py",
         "source": "DrugCentral",
-        "source_page": DRUGCENTRAL_DOWNLOAD_PAGE,
-        "database_dump_url": DRUGCENTRAL_DUMP_URL,
-        "public_postgres": {
-            "host": args.host,
-            "port": args.port,
-            "dbname": args.dbname,
-            "user": args.user,
-        },
-        "started_at_utc": now_utc(),
-        "interpretation": (
-            "DrugCentral records are structured drug-condition clinical annotations. "
-            "The original relationship label is preserved and normalised into "
-            "relationship_type. Rows may include indications, contraindications, "
-            "off-label uses, treatment relationships, and related clinical mappings "
-            "depending on the source table."
+
+        "internal_source":
+            "DrugCentral omop_relationship",
+
+        "drugcentral_struct_id": drug_id,
+
+        "drugcentral_relationship": normalized,
+
+        "concept_kind": clean(
+            row["concept_kind"]
         ),
-        "unified_output_columns": OUTPUT_COLUMNS,
+
+        "source_table": "omop_relationship",
+
+        "source_relationship_raw": clean(
+            row["source_relationship_raw"]
+        ),
+
+        "relationship_category": rel,
+
+        "drugcentral_record_id": clean(
+            row["drugcentral_record_id"]
+        ),
+
+        "drugcentral_source_row_number": clean(
+            row["drugcentral_source_row_number"]
+        ),
+
+        "disease_identifier_source_column":
+            id_col,
+
+        "snomed_conceptid": clean(
+            row["snomed_conceptid"]
+        ),
+
+        "umls_cui": clean(
+            row["umls_cui"]
+        ),
+
+        "omop_concept_id": clean(
+            row["omop_concept_id"]
+        ),
+
+        "concept_name": clean(
+            row["concept_name"]
+        ),
+
+        "snomed_full_name": clean(
+            row["snomed_full_name"]
+        ),
+
+        "drug_name_lookup_status":
+            drug_lookup,
+
+        "disease_name_lookup_status":
+            disease_lookup,
+
+        "evidence_granularity":
+            "source_omop_relationship_row",
     }
 
-    conn = None
+    for entity, data in (
+        ("drug", drug_fields),
+        ("disease", disease_fields),
+    ):
+        for suffix, val in zip(
+            (
+                "original",
+                "namespace",
+                "canonical",
+                "validation",
+            ),
+            data,
+        ):
+            out[
+                f"{entity}_identifier_{suffix}"
+            ] = val
+
+    return out, ""
+
+
+def safe_ident(s):
+    if not re.fullmatch(
+        r"[a-z_][a-z0-9_]*",
+        s,
+    ):
+        raise RuntimeError(
+            f"Unexpected PostgreSQL identifier {s!r}"
+        )
+
+    return '"' + s + '"'
+
+
+def pg_columns(cur, table):
+    cur.execute(
+        "SELECT column_name "
+        "FROM information_schema.columns "
+        "WHERE table_schema='public' "
+        "AND table_name=%s "
+        "ORDER BY ordinal_position",
+        (table,),
+    )
+
+    return [
+        r[0]
+        for r in cur.fetchall()
+    ]
+
+
+def text_sql(alias, name):
+    if not name:
+        return "''"
+
+    return (
+        f"COALESCE(TRIM(CAST("
+        f"{alias}.{safe_ident(name)} "
+        f"AS TEXT)), '')"
+    )
+
+
+def fetch_snapshot(args, temp_raw):
+    try:
+        import psycopg2
+    except ImportError as exc:
+        raise RuntimeError(
+            "Install psycopg2-binary to fetch "
+            "the DrugCentral PostgreSQL snapshot"
+        ) from exc
+
+    heading(
+        "DATABASE SOURCE INSPECTION "
+        "AND FROZEN EXTRACTION"
+    )
+
+    conn = psycopg2.connect(
+        host=args.host,
+        port=args.port,
+        dbname=args.dbname,
+        user=args.user,
+        password=args.password,
+        connect_timeout=45,
+        application_name="drugcentral_source_event_export",
+    )
 
     try:
-        print_section("DrugCentral -> unified drug-disease association processing")
-        print(f"[HOST] {args.host}:{args.port}")
-        print(f"[DB]   {args.dbname}")
-        print(f"[USER] {args.user}")
-        print(f"[OUT]  {out_csv}")
-
-        conn = psycopg2.connect(
-            host=args.host,
-            port=args.port,
-            user=args.user,
-            password=args.password,
-            dbname=args.dbname,
-            connect_timeout=60,
+        conn.set_session(
+            readonly=True,
+            isolation_level="REPEATABLE READ",
+            autocommit=False,
         )
 
-        with conn.cursor() as cur:
-            metadata["database_inspection"] = inspect_database(cur, head_n=args.head_n)
+        with conn.cursor() as c:
+            cols = pg_columns(
+                c,
+                "omop_relationship",
+            )
 
-            sql, source_table = choose_sql(cur)
+            if not cols:
+                raise RuntimeError(
+                    "public.omop_relationship absent; "
+                    "refusing unverified alternative table"
+                )
 
-            metadata["chosen_source_table"] = source_table
-            metadata["sql_used"] = sql
+            required = {
+                "struct_id",
+                "relationship_name",
+            }
 
-            print_section("Chosen DrugCentral extraction route")
-            print(f"[SOURCE TABLE] {source_table}")
-            print("[SQL USED]")
-            print(sql)
+            if (
+                not required.issubset(cols)
+                or not (
+                    {
+                        "snomed_full_name",
+                        "concept_name",
+                    } & set(cols)
+                )
+            ):
+                raise RuntimeError(
+                    "Unrecognised omop_relationship "
+                    f"schema: {cols}"
+                )
 
-        metadata["processing"] = export_to_csv(
-            conn=conn,
-            sql=sql,
-            source_table=source_table,
-            out_csv=out_csv,
-            fetch_size=args.fetch_size,
+            print(
+                "[SOURCE HEADER] omop_relationship:",
+                " | ".join(cols),
+            )
+
+            struct_cols = pg_columns(
+                c,
+                "structures",
+            )
+
+            if (
+                struct_cols
+                and {
+                    "id",
+                    "name",
+                }.issubset(struct_cols)
+            ):
+                c.execute(
+                    'SELECT COUNT(*) FROM '
+                    '(SELECT id FROM public.structures '
+                    'GROUP BY id HAVING COUNT(*) > 1) x'
+                )
+
+                duplicate_ids = c.fetchone()[0]
+
+                if duplicate_ids:
+                    raise RuntimeError(
+                        f"structures.id has "
+                        f"{duplicate_ids} duplicate keys"
+                    )
+
+                join = (
+                    'LEFT JOIN public.structures d '
+                    'ON r."struct_id" = d."id"'
+                )
+
+                drug_name = text_sql(
+                    "d",
+                    "name",
+                )
+
+                name_strategy = (
+                    "structures.id unique LEFT JOIN "
+                    "omop_relationship.struct_id"
+                )
+
+            else:
+                join = ""
+                drug_name = "''"
+
+                name_strategy = (
+                    "no structures.id/name; "
+                    "use flagged struct_id placeholder"
+                )
+
+            print(
+                "[STRUCTURES HEADER]",
+                struct_cols,
+            )
+
+            print(
+                "[DRUG NAME JOIN]",
+                name_strategy,
+            )
+
+            c.execute(
+                "SELECT COUNT(*) "
+                "FROM public.omop_relationship"
+            )
+
+            original_count = int(
+                c.fetchone()[0]
+            )
+
+            dbversion = []
+
+            if pg_columns(
+                c,
+                "dbversion",
+            ):
+                c.execute(
+                    "SELECT * FROM public.dbversion"
+                )
+
+                dbcols = [
+                    desc[0]
+                    for desc in c.description
+                ]
+
+                dbversion = [
+                    dict(zip(dbcols, r))
+                    for r in c.fetchall()
+                ]
+
+            print(
+                "[ORIGINAL SOURCE ROWS]",
+                f"{original_count:,}",
+            )
+
+            print(
+                "[DBVERSION]",
+                dbversion,
+            )
+
+            def optional(name):
+                return text_sql(
+                    "r",
+                    name if name in cols else None,
+                )
+
+            name_expr = (
+                f"COALESCE("
+                f"NULLIF({optional('snomed_full_name')}, ''), "
+                f"{optional('concept_name')})"
+            )
+
+            query = f"""
+                SELECT
+                    {optional('id')} AS drugcentral_record_id,
+                    {text_sql('r', 'struct_id')} AS drugcentral_struct_id,
+                    {drug_name} AS drug_name,
+                    {optional('snomed_conceptid')} AS snomed_conceptid,
+                    {optional('umls_cui')} AS umls_cui,
+                    {optional('concept_id')} AS omop_concept_id,
+                    {optional('concept_name')} AS concept_name,
+                    {optional('snomed_full_name')} AS snomed_full_name,
+                    {name_expr} AS disease_or_condition_name,
+                    {text_sql('r', 'relationship_name')} AS source_relationship_raw,
+                    {optional('cui_semantic_type')} AS concept_kind,
+                    'omop_relationship' AS source_table
+                FROM public.omop_relationship r
+                {join}
+                ORDER BY r."struct_id", r."relationship_name"
+                {', r."concept_id" NULLS FIRST' if 'concept_id' in cols else ''}
+            """
+
+            c.execute(
+                f"SELECT COUNT(*) FROM ({query}) q"
+            )
+
+            joined_count = int(
+                c.fetchone()[0]
+            )
+
+            if joined_count != original_count:
+                raise RuntimeError(
+                    "Join changes row count "
+                    f"{original_count} -> {joined_count}"
+                )
+
+        count = 0
+
+        temp_raw.parent.mkdir(
+            parents=True,
+            exist_ok=True,
         )
 
-        metadata["finished_at_utc"] = now_utc()
-        metadata["status"] = "success"
+        with temp_raw.open(
+            "w",
+            encoding="utf-8",
+            newline="",
+        ) as output:
 
-    except Exception as e:
-        metadata["finished_at_utc"] = now_utc()
-        metadata["status"] = "failed"
-        metadata["error"] = repr(e)
-        raise
+            writer = csv.DictWriter(
+                output,
+                fieldnames=RAW_COLUMNS,
+            )
+
+            writer.writeheader()
+
+            with conn.cursor(
+                name="drugcentral_snapshot_stream"
+            ) as stream:
+
+                stream.itersize = args.fetch_size
+                stream.execute(query)
+
+                for fields in iter(
+                    lambda: stream.fetchmany(
+                        args.fetch_size
+                    ),
+                    [],
+                ):
+                    for source_row in fields:
+                        count += 1
+
+                        row = dict(
+                            zip(
+                                RAW_COLUMNS[1:],
+                                source_row,
+                            )
+                        )
+
+                        writer.writerow({
+                            "drugcentral_source_row_number":
+                                count,
+                            **row,
+                        })
+
+                    if count % 100000 < len(fields):
+                        print(
+                            "[SNAPSHOT EXPORTED]",
+                            f"{count:,}",
+                            flush=True,
+                        )
+
+        if (
+            count != joined_count
+            or count == 0
+        ):
+            raise RuntimeError(
+                "Snapshot row conservation failure: "
+                f"{count} != {joined_count}"
+            )
+
+        manifest = {
+            "source": "DrugCentral",
+
+            "source_table":
+                "public.omop_relationship",
+
+            "captured_at_utc": now(),
+
+            "dbversion": dbversion,
+
+            "source_table_header": cols,
+
+            "structures_header": struct_cols,
+
+            "name_join": name_strategy,
+
+            "source_rows": original_count,
+
+            "rows_after_name_join": joined_count,
+
+            "raw_snapshot_rows": count,
+
+            "raw_snapshot_columns": RAW_COLUMNS,
+
+            "query": query,
+
+            "raw_snapshot_sha256":
+                digest(temp_raw),
+
+            "access_host": args.host,
+
+            "access_port": args.port,
+
+            "access_database": args.dbname,
+        }
+
+        print(
+            "[FROZEN RAW SNAPSHOT]",
+            f"{count:,}",
+            "rows",
+            manifest["raw_snapshot_sha256"],
+        )
+
+        return manifest
 
     finally:
-        if conn is not None:
-            conn.close()
+        conn.close()
 
-        metadata_path.parent.mkdir(parents=True, exist_ok=True)
 
-        with open(metadata_path, "w", encoding="utf-8") as f:
-            json.dump(metadata, f, indent=2, default=str)
+def process_source(
+    path,
+    expected_rows,
+    out_tmp,
+    dedup_tmp,
+    rejects_tmp,
+):
+    heading(
+        "PROCESS FROZEN DRUGCENTRAL SOURCE ROWS"
+    )
 
-        print_section("METADATA WRITTEN")
-        print(metadata_path)
+    counts = Counter()
+    relations = Counter()
+    raw_rels = Counter()
+    id_sources = Counter()
+    drug_names = Counter()
+    diseases = Counter()
+    validations = Counter()
+
+    unique_pairs = set()
+    seen = {}
+
+    example = None
+
+    with (
+        path.open(
+            "r",
+            encoding="utf-8-sig",
+            newline="",
+        ) as stream,
+
+        out_tmp.open(
+            "w",
+            encoding="utf-8",
+            newline="",
+        ) as out,
+
+        rejects_tmp.open(
+            "w",
+            encoding="utf-8",
+            newline="",
+        ) as reject,
+    ):
+        reader = csv.reader(
+            stream,
+            strict=True,
+        )
+
+        header = next(reader)
+
+        if header != RAW_COLUMNS:
+            raise RuntimeError(
+                "Frozen source header differs: "
+                f"{header}"
+            )
+
+        writer = csv.DictWriter(
+            out,
+            fieldnames=COLUMNS,
+        )
+
+        bad_writer = csv.DictWriter(
+            reject,
+            fieldnames=REJECT_COLS,
+        )
+
+        writer.writeheader()
+        bad_writer.writeheader()
+
+        for ordinal, fields in enumerate(
+            reader,
+            1,
+        ):
+            if len(fields) != len(RAW_COLUMNS):
+                raise RuntimeError(
+                    "Malformed frozen row "
+                    f"{ordinal}: {len(fields)} fields"
+                )
+
+            item = dict(
+                zip(RAW_COLUMNS, fields)
+            )
+
+            if (
+                item["drugcentral_source_row_number"]
+                != str(ordinal)
+            ):
+                raise RuntimeError(
+                    "Unexpected source record "
+                    f"ordinal at row {ordinal}"
+                )
+
+            counts["input_rows"] += 1
+
+            rec, reason = from_raw(item)
+
+            if reason:
+                counts["rejected_rows"] += 1
+
+                bad_writer.writerow({
+                    "source_row_number": ordinal,
+
+                    "source_record_id":
+                        item["drugcentral_record_id"],
+
+                    "reason": reason,
+
+                    "raw_record_json": json.dumps(
+                        item,
+                        ensure_ascii=False,
+                    ),
+                })
+
+                continue
+
+            writer.writerow(rec)
+
+            counts["retained_rows"] += 1
+
+            if example is None:
+                example = rec
+
+            relations[
+                rec["relationship_type"]
+            ] += 1
+
+            raw_rels[
+                rec["source_relationship_raw"]
+                or "[missing]"
+            ] += 1
+
+            id_sources[
+                rec["disease_identifier_source_column"]
+                or "[missing]"
+            ] += 1
+
+            drug_names[
+                rec["drug_name_lookup_status"]
+            ] += 1
+
+            diseases[
+                rec["disease_name_lookup_status"]
+            ] += 1
+
+            validations[
+                rec["disease_identifier_validation"]
+            ] += 1
+
+            unique_pairs.add((
+                rec["drug_identifier"],
+                rec["disease_or_condition_identifier"],
+                rec["disease_or_condition_identifier_type"],
+                rec["relationship_type"],
+            ))
+
+            # Dedup is a separate reporting view.
+            # The main output preserves every event.
+
+            key = tuple(
+                rec[x]
+                for x in (
+                    "drugcentral_struct_id",
+                    "snomed_conceptid",
+                    "umls_cui",
+                    "omop_concept_id",
+                    "source_relationship_raw",
+                    "concept_kind",
+                    "concept_name",
+                    "snomed_full_name",
+                )
+            )
+
+            if key not in seen:
+                seen[key] = [rec, []]
+
+            seen[key][1].append(
+                rec["drugcentral_source_row_number"]
+            )
+
+    if (
+        counts["input_rows"] != expected_rows
+        or (
+            counts["retained_rows"]
+            + counts["rejected_rows"]
+        ) != expected_rows
+    ):
+        raise RuntimeError(
+            "Source row accounting failed: "
+            f"{dict(counts)}, expected {expected_rows}"
+        )
+
+    if not counts["retained_rows"]:
+        raise RuntimeError(
+            "No eligible DrugCentral rows; "
+            "old processed output retained"
+        )
+
+    with dedup_tmp.open(
+        "w",
+        encoding="utf-8",
+        newline="",
+    ) as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=COLUMNS + DEDUP_EXTRA,
+        )
+
+        writer.writeheader()
+
+        for rec, refs in seen.values():
+            writer.writerow({
+                **rec,
+
+                "drugcentral_supporting_record_count":
+                    len(refs),
+
+                "drugcentral_supporting_source_rows":
+                    "|".join(refs),
+            })
+
+    if sum(
+        len(v[1])
+        for v in seen.values()
+    ) != counts["retained_rows"]:
+        raise RuntimeError(
+            "Deduplication lost source support"
+        )
+
+    print(
+        "[INPUT ROWS]",
+        f"{counts['input_rows']:,}",
+    )
+
+    print(
+        "[RETAINED / REJECTED]",
+        f"{counts['retained_rows']:,}",
+        f"/ {counts['rejected_rows']:,}",
+    )
+
+    print(
+        "[DEDUP VIEW ASSERTIONS]",
+        f"{len(seen):,}",
+    )
+
+    print(
+        "[RELATIONSHIP COUNTS]",
+        dict(relations),
+    )
+
+    print(
+        "[RAW RELATIONSHIPS]",
+        dict(raw_rels),
+    )
+
+    print(
+        "[DISEASE IDENTIFIER SOURCE]",
+        dict(id_sources),
+    )
+
+    print(
+        "[DRUG NAME LOOKUP]",
+        dict(drug_names),
+    )
+
+    print(
+        "[DISEASE NAME LOOKUP]",
+        dict(diseases),
+    )
+
+    print(
+        "[IDENTIFIER SYNTAX]",
+        dict(validations),
+    )
+
+    print(
+        "[OUTPUT COLUMNS]",
+        " | ".join(COLUMNS),
+    )
+
+    print(
+        "[REAL OUTPUT EXAMPLE]",
+        json.dumps(
+            example,
+            ensure_ascii=False,
+            indent=2,
+        )[:2200],
+    )
+
+    return {
+        "counts": dict(counts),
+
+        "deduplicated_assertions":
+            len(seen),
+
+        "distinct_drug_disease_relationship_keys":
+            len(unique_pairs),
+
+        "relationship_type_counts":
+            dict(relations),
+
+        "source_relationship_raw_counts":
+            dict(raw_rels),
+
+        "disease_identifier_source_column_counts":
+            dict(id_sources),
+
+        "drug_name_lookup_counts":
+            dict(drug_names),
+
+        "disease_name_lookup_counts":
+            dict(diseases),
+
+        "disease_identifier_validation_counts":
+            dict(validations),
+
+        "output_header": COLUMNS,
+
+        "first_output_record": example,
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description=__doc__
+    )
+
+    ap.add_argument(
+        "--raw-dir",
+        type=Path,
+        default=RAW_DIR,
+    )
+
+    ap.add_argument(
+        "--out",
+        type=Path,
+        default=(
+            OUT_DIR /
+            "drugcentral_drug_disease.csv"
+        ),
+    )
+
+    ap.add_argument(
+        "--metadata",
+        type=Path,
+        default=(
+            META_DIR /
+            "drugcentral_processing_metadata.json"
+        ),
+    )
+
+    ap.add_argument(
+        "--offline",
+        action="store_true",
+        help="Only reuse verified cached raw snapshot",
+    )
+
+    ap.add_argument(
+        "--refresh-source",
+        action="store_true",
+        help=(
+            "Explicitly replace frozen source "
+            "from live PostgreSQL"
+        ),
+    )
+
+    ap.add_argument(
+        "--host",
+        default=os.getenv(
+            "DRUGCENTRAL_HOST",
+            "unmtid-dbs.net",
+        ),
+    )
+
+    ap.add_argument(
+        "--port",
+        type=int,
+        default=int(
+            os.getenv(
+                "DRUGCENTRAL_PORT",
+                "5433",
+            )
+        ),
+    )
+
+    ap.add_argument(
+        "--dbname",
+        default=os.getenv(
+            "DRUGCENTRAL_DBNAME",
+            "drugcentral",
+        ),
+    )
+
+    ap.add_argument(
+        "--user",
+        default=os.getenv(
+            "DRUGCENTRAL_USER",
+            "drugman",
+        ),
+    )
+
+    ap.add_argument(
+        "--password",
+        default=os.getenv(
+            "DRUGCENTRAL_PASSWORD",
+            "dosage",
+        ),
+    )
+
+    ap.add_argument(
+        "--fetch-size",
+        type=int,
+        default=20000,
+    )
+
+    args = ap.parse_args()
+
+    if (
+        args.offline
+        and args.refresh_source
+    ):
+        ap.error(
+            "--offline and --refresh-source "
+            "are mutually exclusive"
+        )
+
+    if args.fetch_size < 1:
+        ap.error(
+            "--fetch-size must be positive"
+        )
+
+    raw_dir = args.raw_dir.resolve()
+    out = args.out.resolve()
+    meta = args.metadata.resolve()
+
+    snapshot = raw_dir / RAW_NAME
+    manifest_path = raw_dir / MANIFEST_NAME
+
+    dedup = out.with_name(
+        "drugcentral_drug_disease_deduplicated.csv"
+    )
+
+    rejects = out.with_name(
+        "drugcentral_rejected_rows.csv"
+    )
+
+    for p in (
+        snapshot,
+        manifest_path,
+        out,
+        dedup,
+        rejects,
+        meta,
+    ):
+        p.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+    heading(
+        "1. RAW FILE INVENTORY AND REUSE RULE"
+    )
+
+    for path in sorted(
+        raw_dir.rglob("*")
+    ):
+        if path.is_file():
+            print(
+                "  ",
+                path.relative_to(raw_dir),
+                f"({path.stat().st_size:,} bytes)",
+            )
+
+    temp_paths = []
+    staged = {}
+
+    try:
+        if (
+            snapshot.is_file()
+            and manifest_path.is_file()
+            and not args.refresh_source
+        ):
+            manifest = json.loads(
+                manifest_path.read_text(
+                    encoding="utf-8"
+                )
+            )
+
+            if (
+                manifest.get("raw_snapshot_sha256")
+                != digest(snapshot)
+                or manifest.get("raw_snapshot_columns")
+                != RAW_COLUMNS
+            ):
+                raise RuntimeError(
+                    "Frozen snapshot/manifest hash "
+                    "or schema mismatch; do not merge"
+                )
+
+            source = snapshot
+
+            print(
+                "[REUSING VERIFIED RAW SNAPSHOT]",
+                source,
+            )
+
+        else:
+            if args.offline:
+                raise FileNotFoundError(
+                    "Offline mode needs both verified "
+                    "snapshot CSV and manifest JSON"
+                )
+
+            if (
+                snapshot.exists()
+                and not args.refresh_source
+            ):
+                raise RuntimeError(
+                    "Raw CSV exists without a verified "
+                    "manifest; use --refresh-source explicitly"
+                )
+
+            source = snapshot.with_name(
+                snapshot.name + ".processing.tmp"
+            )
+
+            temp_paths.append(source)
+
+            manifest = fetch_snapshot(
+                args,
+                source,
+            )
+
+            manifest_tmp = stage_json(
+                manifest_path,
+                manifest,
+            )
+
+            staged[snapshot] = source
+            staged[manifest_path] = manifest_tmp
+
+            temp_paths.append(manifest_tmp)
+
+        expected = int(
+            manifest["raw_snapshot_rows"]
+        )
+
+        output_tmp = out.with_name(
+            out.name + ".processing.tmp"
+        )
+
+        dedup_tmp = dedup.with_name(
+            dedup.name + ".processing.tmp"
+        )
+
+        rejects_tmp = rejects.with_name(
+            rejects.name + ".processing.tmp"
+        )
+
+        for p in (
+            output_tmp,
+            dedup_tmp,
+            rejects_tmp,
+        ):
+            temp_paths.append(p)
+
+        result = process_source(
+            source,
+            expected,
+            output_tmp,
+            dedup_tmp,
+            rejects_tmp,
+        )
+
+        staged[out] = output_tmp
+        staged[dedup] = dedup_tmp
+        staged[rejects] = rejects_tmp
+
+        report = {
+            "status": "success",
+
+            "finished_at_utc": now(),
+
+            "source": "DrugCentral",
+
+            "source_table":
+                "public.omop_relationship",
+
+            "source_page":
+                "https://drugcentral.org/download",
+
+            "raw_snapshot": str(snapshot),
+
+            "raw_snapshot_metadata":
+                str(manifest_path),
+
+            "raw_snapshot_sha256":
+                digest(source),
+
+            "database_release":
+                manifest.get("dbversion", []),
+
+            "source_columns":
+                manifest.get("source_table_header", []),
+
+            "raw_columns": RAW_COLUMNS,
+
+            "source_name_join":
+                manifest.get("name_join", ""),
+
+            "source_sql":
+                manifest.get("query", ""),
+
+            "source_row_accounting": result,
+
+            "deduplication": (
+                "Full source evidence retained; "
+                "separate exact-assertion view "
+                "with supporting raw row numbers"
+            ),
+
+            "identifiers": (
+                "DrugCentral structure ID; condition "
+                "primary ID column-specific "
+                "SNOMEDCT > UMLS > OMOP; "
+                "all IDs retained"
+            ),
+
+            "caveat": (
+                "Clinical annotations contain "
+                "contraindications, indications and "
+                "off-label uses; overlapping upstream "
+                "evidence is not independent validation"
+            ),
+
+            "output_files": {
+                "full": str(out),
+
+                "deduplicated": str(dedup),
+
+                "rejections": str(rejects),
+            },
+
+            "output_sha256": {
+                "full": digest(output_tmp),
+
+                "deduplicated": digest(dedup_tmp),
+
+                "rejections": digest(rejects_tmp),
+            },
+        }
+
+        metadata_tmp = stage_json(
+            meta,
+            report,
+        )
+
+        temp_paths.append(metadata_tmp)
+        staged[meta] = metadata_tmp
+
+        heading(
+            "OVERWRITE ORIGINAL PATHS "
+            "ONLY AFTER VALIDATION"
+        )
+
+        for destination, tmp in staged.items():
+            tmp.replace(destination)
+
+            print(
+                "[WRITTEN]",
+                destination,
+            )
+
+        print(
+            "SUCCESS: Merge the FULL "
+            "drugcentral_drug_disease.csv, "
+            "not the deduplicated view"
+        )
+
+    finally:
+        for p in temp_paths:
+            p.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

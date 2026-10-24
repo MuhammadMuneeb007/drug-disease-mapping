@@ -1,535 +1,300 @@
+
 #!/usr/bin/env python3
+"""Hetionet v1.0 Compound-Disease edges -> source-event CSV.
+
+Reuses existing data/raw/hetionet/ files. Run: python hetionet.py
+Overwrites the SAME data/processed/hetionet output files only after checks.
+CtD = treats; CpD = palliates; neither implies regulatory approval.
+TSV lacks upstream license annotations: inspect Hetionet upstream terms before redistributing.
 """
-Hetionet v1.0 -> unified compound/drug-disease association CSV
-
-Purpose
--------
-Process Hetionet v1.0 Compound-Disease edges into a publication-ready,
-provenance-aware CSV for a multi-source drug-disease association dataset.
-
-Source repository:
-    https://github.com/hetio/hetionet
-
-Files used:
-    hetionet-v1.0-nodes.tsv
-    hetionet-v1.0-edges.sif.gz
-
-Input URLs:
-    https://github.com/hetio/hetionet/raw/main/hetnet/tsv/hetionet-v1.0-nodes.tsv
-    https://github.com/hetio/hetionet/raw/main/hetnet/tsv/hetionet-v1.0-edges.sif.gz
-
-Citation:
-    Himmelstein DS et al. Systematic integration of biomedical knowledge
-    prioritizes drugs for repurposing. eLife. 2017;6:e26726.
-    doi:10.7554/eLife.26726
-
-License:
-    CC0 1.0 Universal / Public Domain
-
-Important interpretation
-------------------------
-Hetionet records are knowledge-graph Compound-Disease relationships.
-They should not be treated as the same evidence type as approved drug
-indications from curated clinical drug resources.
-
-Drug-disease metaedges retained:
-    CtD = Compound-treats-Disease
-    CpD = Compound-palliates-Disease
-
-Unified output columns
-----------------------
-drug_name
-drug_identifier
-drug_identifier_type
-disease_or_condition_name
-disease_or_condition_identifier
-disease_or_condition_identifier_type
-relationship_type
-evidence_type
-source
-internal_source
-
-Hetionet-specific metadata columns
-----------------------------------
-metaedge
-source_node_id
-target_node_id
-evidence_text
-
-Requirements
-------------
-pip install pandas
-"""
-
 from __future__ import annotations
 
+import argparse
 import gzip
 import hashlib
 import json
 import os
+import shutil
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
 
+ROOT = Path(os.environ.get("DRUG_DISEASE_ROOT", Path(__file__).resolve().parent)).resolve()
+RAW = ROOT / "data/raw/hetionet"
+OUT = ROOT / "data/processed/hetionet"
+BASE = "https://github.com/hetio/hetionet/raw/main/hetnet/tsv"
+NODES_NAME = "hetionet-v1.0-nodes.tsv"
+EDGES_NAME = "hetionet-v1.0-edges.sif.gz"
 
-# ============================================================
-# CONFIG
-# ============================================================
-
-HETIONET_BASE_URL = "https://github.com/hetio/hetionet/raw/main/hetnet/tsv"
-
-NODES_URL = f"{HETIONET_BASE_URL}/hetionet-v1.0-nodes.tsv"
-EDGES_URL = f"{HETIONET_BASE_URL}/hetionet-v1.0-edges.sif.gz"
-
-RAW_DIR = (
-    "/data/ascher02/uqmmune1/ANNOVAR/drug_disease_data/"
-    "drug-disease-mapping/data/raw/hetionet"
-)
-
-OUTPUT_DIR = (
-    "/data/ascher02/uqmmune1/ANNOVAR/drug_disease_data/"
-    "drug-disease-mapping/data/processed/hetionet"
-)
-
-NODES_FILE = os.path.join(RAW_DIR, "hetionet-v1.0-nodes.tsv")
-EDGES_FILE = os.path.join(RAW_DIR, "hetionet-v1.0-edges.sif.gz")
-
-OUTPUT_FILE = os.path.join(OUTPUT_DIR, "hetionet_drug_disease.csv")
-DEDUP_FILE = os.path.join(OUTPUT_DIR, "hetionet_drug_disease_deduplicated.csv")
-SUMMARY_FILE = os.path.join(OUTPUT_DIR, "hetionet_summary.json")
-
-
-# IMPORTANT:
-# Do not call CtD "approved_indication".
-# Hetionet CtD means Compound-treats-Disease, not necessarily approved indication.
-DRUG_DISEASE_METAEDGES = {
-    "CtD": (
-        "compound_treats_disease",
-        "hetionet_compound_treats_disease",
-    ),
-    "CpD": (
-        "compound_palliates_disease",
-        "hetionet_compound_palliates_disease",
-    ),
+CORE = [
+    "drug_name", "drug_identifier", "drug_identifier_type",
+    "disease_or_condition_name", "disease_or_condition_identifier",
+    "disease_or_condition_identifier_type", "relationship_type",
+    "evidence_type", "source", "internal_source",
+]
+EXTRA = [
+    "metaedge", "source_node_id", "target_node_id", "evidence_text",
+    "hetionet_source_edge_row_number",
+]
+COLUMNS = CORE + EXTRA
+RELATIONS = {
+    "CtD": ("compound_treats_disease", "hetionet_compound_treats_disease"),
+    "CpD": ("compound_palliates_disease", "hetionet_compound_palliates_disease"),
 }
 
 
-OUTPUT_COLUMNS = [
-    # Unified schema
-    "drug_name",
-    "drug_identifier",
-    "drug_identifier_type",
-    "disease_or_condition_name",
-    "disease_or_condition_identifier",
-    "disease_or_condition_identifier_type",
-    "relationship_type",
-    "evidence_type",
-    "source",
-    "internal_source",
-
-    # Hetionet-specific metadata
-    "metaedge",
-    "source_node_id",
-    "target_node_id",
-    "evidence_text",
-]
+def heading(text):
+    print("\n" + "=" * 94 + "\n" + text + "\n" + "=" * 94, flush=True)
 
 
-# ============================================================
-# HELPERS
-# ============================================================
-
-def now_utc() -> str:
+def now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def clean_text(x) -> str:
-    if pd.isna(x):
-        return ""
-    return str(x).strip()
-
-
-def sha256_file(path: str | Path, chunk_size: int = 1024 * 1024) -> str:
-    path = Path(path)
+def checksum(path):
     h = hashlib.sha256()
-
     with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(chunk_size), b""):
-            h.update(chunk)
-
+        for b in iter(lambda: f.read(4 * 1024 * 1024), b""):
+            h.update(b)
     return h.hexdigest()
 
 
-def human_size(num_bytes: int) -> str:
-    size = float(num_bytes)
-
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if size < 1024:
-            return f"{size:.2f} {unit}"
-        size /= 1024
-
-    return f"{size:.2f} PB"
+def assert_not_lfs_pointer(path):
+    if not path.is_file() or path.stat().st_size == 0:
+        raise ValueError(f"Empty or absent input: {path}")
+    with open(path, "rb") as f:
+        prefix = f.read(256)
+    if b"git-lfs.github.com/spec" in prefix or b"oid sha256:" in prefix:
+        raise ValueError(f"Git LFS pointer, not actual Hetionet data: {path}")
 
 
-def is_probable_git_lfs_pointer(path: str | Path) -> bool:
-    """
-    Detect accidental Git LFS pointer downloads.
-
-    Git LFS pointer files are small text files that often contain:
-        version https://git-lfs.github.com/spec/v1
-        oid sha256:...
-        size ...
-    """
-    path = Path(path)
-
-    if not path.exists() or path.stat().st_size == 0:
-        return True
-
-    # Most real Hetionet files are much larger than 1 KB.
-    # If small, inspect the beginning.
-    if path.stat().st_size < 1024:
-        try:
-            text = path.read_text(encoding="utf-8", errors="ignore")
-            if "git-lfs.github.com/spec" in text or "oid sha256:" in text:
-                return True
-        except Exception:
-            return True
-
-    return False
+def ensure_file(path, download_missing):
+    if path.is_file() and path.stat().st_size:
+        assert_not_lfs_pointer(path)
+        print(f"[REUSE] {path}")
+        return
+    if not download_missing:
+        raise FileNotFoundError(f"Required file not present: {path}; use --download_missing")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    url = f"{BASE}/{path.name}"
+    tmp = path.with_name(path.name + ".download")
+    try:
+        print("[DOWNLOAD]", url)
+        urllib.request.urlretrieve(url, tmp)
+        assert_not_lfs_pointer(tmp)
+        tmp.replace(path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
-def test_gzip_file(path: str | Path) -> None:
-    """
-    Ensure gzip file can be read.
-    """
-    path = Path(path)
-
+def gzip_check(path):
     total = 0
     with gzip.open(path, "rb") as f:
-        while True:
-            chunk = f.read(1024 * 1024)
-            if not chunk:
-                break
+        for chunk in iter(lambda: f.read(4 * 1024 * 1024), b""):
             total += len(chunk)
-
-    print(f"[GZIP CHECK] PASS: {path} | uncompressed bytes={total:,}")
-
-
-def download_if_missing(url: str, path: str, force: bool = False) -> None:
-    """
-    Download file if missing.
-
-    If a Git LFS pointer is downloaded instead of real content, raise an error.
-    """
-    path_obj = Path(path)
-
-    if path_obj.exists() and path_obj.stat().st_size > 0 and not force:
-        print(f"[CACHE] Already present: {path}")
-        print(f"        Size:   {human_size(path_obj.stat().st_size)}")
-        print(f"        SHA256: {sha256_file(path_obj)}")
-
-        if is_probable_git_lfs_pointer(path_obj):
-            raise RuntimeError(
-                f"Existing file appears to be a Git LFS pointer or empty: {path}\n"
-                "Delete it and re-download manually from:\n"
-                "https://github.com/hetio/hetionet/tree/main/hetnet/tsv"
-            )
-
-        return
-
-    os.makedirs(path_obj.parent, exist_ok=True)
-
-    print(f"[DOWNLOAD] {url}")
-    urllib.request.urlretrieve(url, path)
-
-    print(f"[DOWNLOADED] {path}")
-    print(f"             Size:   {human_size(path_obj.stat().st_size)}")
-    print(f"             SHA256: {sha256_file(path_obj)}")
-
-    if is_probable_git_lfs_pointer(path_obj):
-        raise RuntimeError(
-            f"Downloaded file appears to be a Git LFS pointer or empty: {path}\n"
-            "Download manually from:\n"
-            "https://github.com/hetio/hetionet/tree/main/hetnet/tsv"
-        )
+    print(f"[GZIP CRC CHECK] PASS; decompressed={total:,} bytes")
+    return total
 
 
-def extract_identifier(node_id: str) -> str:
-    """
-    Hetionet node IDs are formatted as 'Kind::identifier'.
-
-    Examples:
-        Compound::DB00945  -> DB00945
-        Disease::DOID:1612 -> DOID:1612
-    """
-    node_id = clean_text(node_id)
-
-    if "::" in node_id:
-        return node_id.split("::", 1)[1]
-
-    return node_id
+def clean_series(s):
+    return s.fillna("").astype(str).str.strip()
 
 
-def infer_disease_identifier_type(identifier: str) -> str:
-    identifier = clean_text(identifier)
+def extract_id(s):
+    return s.str.split("::", n=1).str[-1]
 
-    if not identifier:
-        return ""
 
-    upper = identifier.upper()
-
-    if upper.startswith("DOID:"):
-        return "DOID"
-
-    if upper.startswith("MESH:"):
-        return "MeSH"
-
-    if upper.startswith("OMIM:"):
-        return "OMIM"
-
-    if upper.startswith("MONDO:"):
-        return "MONDO"
-
+def disease_type(s):
+    v = str(s).strip().upper()
+    for prefix, namespace in (
+        ("DOID:", "DOID"), ("MESH:", "MeSH"),
+        ("OMIM:", "OMIM"), ("MONDO:", "MONDO"),
+        ("EFO:", "EFO"), ("HP:", "HPO"),
+        ("ORPHA:", "Orphanet"),
+    ):
+        if v.startswith(prefix):
+            return namespace
     return "Hetionet_DiseaseID"
 
 
-# ============================================================
-# MAIN
-# ============================================================
+def write_csv_atomic(df, dest):
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(dest.name + ".tmp")
+    try:
+        df.to_csv(tmp, index=False)
+        if list(pd.read_csv(tmp, nrows=0).columns) != list(df.columns):
+            raise RuntimeError("Written CSV schema does not match expected columns")
+        tmp.replace(dest)
+    finally:
+        tmp.unlink(missing_ok=True)
 
-def main() -> None:
-    print("=" * 100)
-    print("HETIONET v1.0 DRUG-DISEASE PROCESSING")
-    print("=" * 100)
-    print("[SOURCE] Hetionet v1.0")
-    print(f"[NODES URL] {NODES_URL}")
-    print(f"[EDGES URL] {EDGES_URL}")
-    print("[DOI] 10.7554/eLife.26726")
-    print("[LICENSE] CC0 1.0 Universal")
-    print("=" * 100)
 
-    os.makedirs(RAW_DIR, exist_ok=True)
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+def write_json_atomic(obj, dest):
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(dest.name + ".tmp")
+    try:
+        tmp.write_text(json.dumps(obj, indent=2, ensure_ascii=False, default=str) + "\n", encoding="utf-8")
+        tmp.replace(dest)
+    finally:
+        tmp.unlink(missing_ok=True)
 
-    download_if_missing(NODES_URL, NODES_FILE)
-    download_if_missing(EDGES_URL, EDGES_FILE)
 
-    # Validate gzip edge file before reading.
-    test_gzip_file(EDGES_FILE)
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--raw_dir", default=str(RAW))
+    ap.add_argument("--output_dir", default=str(OUT))
+    ap.add_argument("--download_missing", action="store_true")
+    args = ap.parse_args()
 
-    # ------------------------------------------------------------
-    # Load nodes
-    # ------------------------------------------------------------
-    print(f"[INFO] Reading nodes: {NODES_FILE}")
+    raw = Path(args.raw_dir).resolve()
+    dest = Path(args.output_dir).resolve()
+    nodes_path, edges_path = raw / NODES_NAME, raw / EDGES_NAME
+    output = dest / "hetionet_drug_disease.csv"
+    dedup_output = dest / "hetionet_drug_disease_deduplicated.csv"
+    summary_output = dest / "hetionet_summary.json"
 
-    nodes = pd.read_csv(
-        NODES_FILE,
-        sep="\t",
-        dtype=str,
-        keep_default_na=False,
-    )
-
-    print(f"[INFO] Nodes loaded: {len(nodes):,}")
-    print(f"[INFO] Node columns: {list(nodes.columns)}")
-
-    expected_node_cols = {"id", "name", "kind"}
-    missing_node_cols = expected_node_cols - set(nodes.columns)
-
-    if missing_node_cols:
-        raise ValueError(
-            f"Missing required node columns: {sorted(missing_node_cols)}"
-        )
-
-    id_to_name = dict(zip(nodes["id"], nodes["name"]))
-    id_to_kind = dict(zip(nodes["id"], nodes["kind"]))
-
-    n_compound = sum(1 for k in id_to_kind.values() if k == "Compound")
-    n_disease = sum(1 for k in id_to_kind.values() if k == "Disease")
-
-    print(f"[INFO] Compound nodes: {n_compound:,}")
-    print(f"[INFO] Disease nodes:  {n_disease:,}")
-
-    # ------------------------------------------------------------
-    # Load edges
-    # ------------------------------------------------------------
-    print(f"[INFO] Reading edges: {EDGES_FILE}")
-
-    edges = pd.read_csv(
-        EDGES_FILE,
-        sep="\t",
-        dtype=str,
-        keep_default_na=False,
-        compression="gzip",
-    )
-
-    print(f"[INFO] Total edges loaded: {len(edges):,}")
-    print(f"[INFO] Edge columns: {list(edges.columns)}")
-
-    expected_edge_cols = {"source", "metaedge", "target"}
-    missing_edge_cols = expected_edge_cols - set(edges.columns)
-
-    if missing_edge_cols:
-        raise ValueError(
-            f"Missing required edge columns: {sorted(missing_edge_cols)}"
-        )
-
-    # ------------------------------------------------------------
-    # Filter drug-disease edges
-    # ------------------------------------------------------------
-    edges_dd = edges[
-        edges["metaedge"].isin(DRUG_DISEASE_METAEDGES.keys())
-    ].copy()
-
-    print(f"[INFO] Drug-disease edges retained: {len(edges_dd):,}")
-
-    metaedge_counts = edges_dd["metaedge"].value_counts().to_dict()
-    print(f"[INFO] Metaedge counts: {metaedge_counts}")
-
-    # ------------------------------------------------------------
-    # Build unified records
-    # ------------------------------------------------------------
-    rows = []
-
-    skipped_wrong_kind = 0
-    skipped_missing_name = 0
-
-    for _, edge in edges_dd.iterrows():
-        source_node_id = clean_text(edge["source"])
-        target_node_id = clean_text(edge["target"])
-        metaedge = clean_text(edge["metaedge"])
-
-        # CtD and CpD are Compound -> Disease in Hetionet.
-        # Keep this defensive check to avoid accidental direction errors.
-        if id_to_kind.get(source_node_id) != "Compound":
-            skipped_wrong_kind += 1
-            continue
-
-        if id_to_kind.get(target_node_id) != "Disease":
-            skipped_wrong_kind += 1
-            continue
-
-        drug_name = clean_text(id_to_name.get(source_node_id, ""))
-        disease_name = clean_text(id_to_name.get(target_node_id, ""))
-
-        if not drug_name or not disease_name:
-            skipped_missing_name += 1
-            continue
-
-        drug_identifier = extract_identifier(source_node_id)
-        disease_identifier = extract_identifier(target_node_id)
-
-        relationship_type, evidence_type = DRUG_DISEASE_METAEDGES[metaedge]
-
-        rows.append(
-            {
-                "drug_name": drug_name,
-                "drug_identifier": drug_identifier,
-                "drug_identifier_type": "DrugBank",
-                "disease_or_condition_name": disease_name,
-                "disease_or_condition_identifier": disease_identifier,
-                "disease_or_condition_identifier_type": infer_disease_identifier_type(
-                    disease_identifier
-                ),
-                "relationship_type": relationship_type,
-                "evidence_type": evidence_type,
-                "source": "Hetionet",
-                "internal_source": "Hetionet v1.0",
-                "metaedge": metaedge,
-                "source_node_id": source_node_id,
-                "target_node_id": target_node_id,
-                "evidence_text": f"metaedge={metaedge}",
+    heading("1. DOWNLOADED SOURCE FILE INVENTORY")
+    for file in (nodes_path, edges_path):
+        ensure_file(file, args.download_missing)
+    inventory = []
+    for file in sorted(raw.rglob("*")):
+        if file.is_file():
+            record = {
+                "file": str(file.relative_to(raw)),
+                "bytes": file.stat().st_size,
+                "used": file.resolve() in {nodes_path.resolve(), edges_path.resolve()},
             }
-        )
+            inventory.append(record)
+            print("  ", "INPUT" if record["used"] else "OTHER", record["file"], f"{record['bytes']:,} bytes")
+    print(f"Physical raw files: {len(inventory)}; processing inputs: 2")
 
-    out = pd.DataFrame(rows, columns=OUTPUT_COLUMNS)
+    compressed_bytes = gzip_check(edges_path)
+    heading("2. ACTUAL RAW HEADERS AND SOURCE RECORD COUNTS")
+    nodes = pd.read_csv(nodes_path, sep="\t", dtype=str, keep_default_na=False, on_bad_lines="error")
+    edges = pd.read_csv(edges_path, sep="\t", dtype=str, keep_default_na=False, compression="gzip", on_bad_lines="error")
+    required_nodes = {"id", "name", "kind"}
+    required_edges = {"source", "metaedge", "target"}
+    if not required_nodes.issubset(nodes.columns) or not required_edges.issubset(edges.columns):
+        raise RuntimeError(f"Wrong schemas: nodes={list(nodes.columns)}, edges={list(edges.columns)}")
+    if nodes["id"].duplicated().any() or nodes["id"].eq("").any():
+        raise RuntimeError("Node IDs are duplicated or empty: join would be ambiguous")
+    if edges[list(required_edges)].isna().any().any():
+        raise RuntimeError("Unexpected null graph edge fields")
 
-    print(f"[INFO] Standardised rows: {len(out):,}")
-    print(f"[INFO] Skipped wrong kind/direction: {skipped_wrong_kind:,}")
-    print(f"[INFO] Skipped missing name: {skipped_missing_name:,}")
+    for name, frame, path in (("NODES", nodes, nodes_path), ("EDGES", edges, edges_path)):
+        print(f"\n[{name}] {len(frame):,} rows; {len(frame.columns)} columns")
+        print("Original header:", " | ".join(frame.columns))
+        if len(frame):
+            for col, value in frame.iloc[0].items():
+                print(f"  {col:18} {str(value)[:160]}")
+    print("\nOriginal metaedge counts: ")
+    print(edges["metaedge"].value_counts().to_string())
 
-    if len(out) == 0:
-        raise RuntimeError("No Hetionet drug-disease rows were produced.")
+    heading("3. GRAPH NODE LOOKUP AND ASSOCIATION MAPPING")
+    print("No cross-database join. Within-source mapping: edges.source -> nodes.id for the compound; edges.target -> nodes.id for the disease.")
+    print("Retain CtD (compound treats disease) and CpD (compound palliates disease); other metaedges excluded.")
+    print("Raw node identifier Kind::ID -> remove Kind:: in unified identifier, keep full original source/target node IDs.")
+    print("Keep source-edge row numbers, source evidence type, and original relationship labels.")
+    print("These graph edges are not proof of regulatory approval or independent clinical validation.")
 
-    print()
-    print("[OUTPUT PREVIEW]")
-    print(out.head(10).to_string(index=False))
+    selected = edges.loc[edges["metaedge"].isin(RELATIONS)].copy()
+    selected["hetionet_source_edge_row_number"] = (selected.index + 1).astype(str)
+    kind_map = nodes.set_index("id")["kind"]
+    name_map = nodes.set_index("id")["name"]
+    selected["source_kind"] = selected["source"].map(kind_map)
+    selected["target_kind"] = selected["target"].map(kind_map)
+    wrong = selected.loc[(selected["source_kind"] != "Compound") | (selected["target_kind"] != "Disease")]
+    if len(wrong):
+        raise RuntimeError(f"{len(wrong):,} CtD/CpD edges have missing/wrong-direction node types; first rows: {wrong.head(5).to_dict('records')}")
 
-    out.to_csv(OUTPUT_FILE, index=False)
+    selected["drug_name"] = clean_series(selected["source"].map(name_map))
+    selected["disease_or_condition_name"] = clean_series(selected["target"].map(name_map))
+    if (selected["drug_name"].eq("") | selected["disease_or_condition_name"].eq("")).any():
+        raise RuntimeError("CtD/CpD source nodes have missing drug or disease names")
 
-    # ------------------------------------------------------------
-    # Deduplicate
-    # ------------------------------------------------------------
-    dedup_cols = [
-        "drug_name",
-        "drug_identifier",
-        "disease_or_condition_name",
-        "disease_or_condition_identifier",
-        "relationship_type",
-    ]
+    out = pd.DataFrame(index=selected.index)
+    out["drug_name"] = selected["drug_name"]
+    out["drug_identifier"] = extract_id(selected["source"])
+    out["drug_identifier_type"] = "DrugBank"
+    out["disease_or_condition_name"] = selected["disease_or_condition_name"]
+    out["disease_or_condition_identifier"] = extract_id(selected["target"])
+    out["disease_or_condition_identifier_type"] = out["disease_or_condition_identifier"].map(disease_type)
+    out["relationship_type"] = selected["metaedge"].map(lambda m: RELATIONS[m][0])
+    out["evidence_type"] = selected["metaedge"].map(lambda m: RELATIONS[m][1])
+    out["source"] = "Hetionet"
+    out["internal_source"] = "Hetionet v1.0"
+    out["metaedge"] = selected["metaedge"]
+    out["source_node_id"] = selected["source"]
+    out["target_node_id"] = selected["target"]
+    out["evidence_text"] = "metaedge=" + selected["metaedge"]
+    out["hetionet_source_edge_row_number"] = selected["hetionet_source_edge_row_number"]
+    out = out.loc[:, COLUMNS].reset_index(drop=True)
+    if out.empty:
+        raise RuntimeError("No CtD/CpD edges found; refusing to overwrite outputs")
+    if len(out) != len(selected):
+        raise RuntimeError("Row conservation failed; evidence events unexpectedly lost")
+    if out["drug_identifier"].eq("").any() or out["disease_or_condition_identifier"].eq("").any():
+        raise RuntimeError("An output identifier is empty")
+    if not out["drug_identifier"].str.fullmatch(r"DB\d{5}").all():
+        raise RuntimeError("Hetionet Compound IDs not in expected DrugBank DB##### format; investigate source nodes")
 
-    dedup = out.drop_duplicates(subset=dedup_cols)
-    dedup.to_csv(DEDUP_FILE, index=False)
+    # Full file = all source edges. Dedup file = identical assertions only;
+    # retain count and source-edge indices as extra metadata.
+    assertion_key = ["drug_identifier", "disease_or_condition_identifier", "relationship_type", "evidence_type"]
+    duplicate_rows = int(out.duplicated(subset=assertion_key).sum())
+    dedup = out.drop_duplicates(subset=assertion_key).copy()
+    support = out.groupby(assertion_key, sort=False)["hetionet_source_edge_row_number"].agg("|".join).rename("supporting_edge_rows")
+    supports = out.groupby(assertion_key, sort=False).size().rename("supporting_edge_count")
+    dedup = dedup.merge(support.reset_index(), on=assertion_key, how="left", validate="one_to_one")
+    dedup = dedup.merge(supports.reset_index(), on=assertion_key, how="left", validate="one_to_one")
+    if int(dedup["supporting_edge_count"].sum()) != len(out):
+        raise RuntimeError("Deduplicated support links fail row accounting")
 
-    # ------------------------------------------------------------
-    # Summary
-    # ------------------------------------------------------------
-    relationship_type_counts = out["relationship_type"].value_counts().to_dict()
-    evidence_type_counts = out["evidence_type"].value_counts().to_dict()
+    heading("4. CONSERVATION, DEDUP AND OUTPUT SCHEMA")
+    print(f"Graph nodes:               {len(nodes):,}")
+    print(f"Graph edges:               {len(edges):,}")
+    print(f"CtD/CpD source edges:      {len(selected):,}")
+    print(f"Full evidence output:      {len(out):,}")
+    print(f"Unique assertions:         {len(dedup):,}")
+    print(f"Repeated assertions:       {duplicate_rows:,}")
+    print("Relation distribution:", out["metaedge"].value_counts().to_dict())
+    print("Output fields:", " | ".join(COLUMNS))
+    print("First actual output row:")
+    for col, value in out.iloc[0].items():
+        print(f"  {col:38} {str(value)[:150]}")
 
+    heading("5. OVERWRITING SAME PROCESSED DIRECTORY")
+    write_csv_atomic(out, output)
+    write_csv_atomic(dedup, dedup_output)
     summary = {
-        "timestamp_utc": now_utc(),
-        "source": "Hetionet v1.0",
+        "status": "success", "timestamp_utc": now(), "source": "Hetionet", "graph_version": "v1.0",
+        "interpretation": "Knowledge-graph CtD treats / CpD palliates, not approved indications",
+        "license_caveat": "Repository's original content CC0; heterogeneous upstream sources have their own licensing; TSV lacks per-edge license properties. Review source-specific licensing before redistribution.",
         "source_repository": "https://github.com/hetio/hetionet",
-        "nodes_url": NODES_URL,
-        "edges_url": EDGES_URL,
-        "citation_doi": "10.7554/eLife.26726",
-        "license": "CC0 1.0 Universal",
-        "interpretation": (
-            "Hetionet records are knowledge-graph Compound-Disease edges. "
-            "CtD is interpreted as compound_treats_disease and CpD as "
-            "compound_palliates_disease. These records are not labelled as "
-            "approved indications."
-        ),
-        "nodes_file": NODES_FILE,
-        "edges_file": EDGES_FILE,
-        "nodes_file_sha256": sha256_file(NODES_FILE),
-        "edges_file_sha256": sha256_file(EDGES_FILE),
-        "nodes_loaded": int(len(nodes)),
-        "compound_nodes": int(n_compound),
-        "disease_nodes": int(n_disease),
-        "total_edges_loaded": int(len(edges)),
-        "drug_disease_edges_filtered": int(len(edges_dd)),
-        "metaedge_counts": metaedge_counts,
-        "rows_written": int(len(out)),
-        "deduplicated_rows_written": int(len(dedup)),
-        "skipped_wrong_kind_or_direction": int(skipped_wrong_kind),
-        "skipped_missing_name": int(skipped_missing_name),
-        "relationship_type_counts": relationship_type_counts,
-        "evidence_type_counts": evidence_type_counts,
-        "unique_drugs": int(out["drug_identifier"].nunique()),
-        "unique_drug_names": int(out["drug_name"].nunique()),
-        "unique_diseases": int(out["disease_or_condition_identifier"].nunique()),
-        "unique_disease_names": int(out["disease_or_condition_name"].nunique()),
-        "output_file": OUTPUT_FILE,
-        "deduplicated_file": DEDUP_FILE,
-        "output_file_sha256": sha256_file(OUTPUT_FILE),
-        "deduplicated_file_sha256": sha256_file(DEDUP_FILE),
-        "output_columns": OUTPUT_COLUMNS,
-        "deduplication_columns": dedup_cols,
+        "input_files_inventory": inventory,
+        "input_headers": {"nodes": list(nodes.columns), "edges": list(edges.columns)},
+        "nodes_file": str(nodes_path), "edges_file": str(edges_path),
+        "nodes_sha256": checksum(nodes_path), "edges_sha256": checksum(edges_path),
+        "edges_uncompressed_bytes": compressed_bytes,
+        "nodes_count": len(nodes), "edges_count": len(edges),
+        "compound_node_count": int(nodes["kind"].eq("Compound").sum()),
+        "disease_node_count": int(nodes["kind"].eq("Disease").sum()),
+        "ctd_cpd_edges": len(selected), "full_output_rows": len(out),
+        "deduplicated_rows": len(dedup), "duplicate_assertion_rows": duplicate_rows,
+        "metaedge_counts": out["metaedge"].value_counts().to_dict(),
+        "join": "edges.source -> nodes.id, edges.target -> nodes.id; validated Compound -> Disease",
+        "identity": "Raw node IDs retained; DrugBank and DOID identifiers extracted after Kind::",
+        "core_schema": CORE, "output_schema": COLUMNS,
+        "source_event_deduplication": "None in full output; assertion-level dedup retains source-edge support links",
+        "output_file": str(output), "deduplicated_file": str(dedup_output),
+        "output_sha256": checksum(output), "dedup_sha256": checksum(dedup_output),
     }
-
-    with open(SUMMARY_FILE, "w") as f:
-        json.dump(summary, f, indent=2)
-
-    print("=" * 100)
-    print("DONE")
-    print("=" * 100)
-    print(f"[OUTPUT]  {OUTPUT_FILE}")
-    print(f"[DEDUP]   {DEDUP_FILE}")
-    print(f"[SUMMARY] {SUMMARY_FILE}")
-    print("=" * 100)
+    write_json_atomic(summary, summary_output)
+    for path in (output, dedup_output, summary_output):
+        print("[WRITTEN]", path)
+    print("SUCCESS. Feed hetionet_drug_disease.csv (FULL evidence) to the eventual merger.")
 
 
 if __name__ == "__main__":

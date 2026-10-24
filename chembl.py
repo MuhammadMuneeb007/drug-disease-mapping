@@ -1,70 +1,21 @@
+
 #!/usr/bin/env python3
+"""ChEMBL 37 drug-indication extractor (one-file, merge-compatible).
+
+Run: python chembl.py
+
+Reuses data/raw/chembl/chembl_37_sqlite.tar.gz.
+Does NOT download by default.
+
+Overwrites data/processed/chembl_drug_disease.csv only
+after successful validation.
+
+The ten common drug--disease fields remain first;
+source evidence follows.
+
+Indication-specific clinical phase is NOT approval of
+every drug--disease pair.
 """
-ChEMBL latest SQLite -> unified ChEMBL drug-disease indication CSV
-
-What this script does
----------------------
-1. Reads the official ChEMBL latest FTP directory.
-2. Finds the latest ChEMBL SQLite archive, e.g. chembl_36_sqlite.tar.gz.
-3. Downloads:
-   - chembl_XX_sqlite.tar.gz
-   - checksums.txt
-   - LICENSE
-   - README
-   - REQUIRED.ATTRIBUTION
-   - chembl_XX_release_notes.txt if available
-   - schema_documentation.txt if available
-4. Verifies the downloaded archive using checksums.txt when possible.
-5. Extracts the SQLite database safely.
-6. Inspects key ChEMBL tables.
-7. Extracts records from the drug_indication table.
-8. Joins molecule_dictionary and disease_dictionary where available.
-9. Exports a provenance-aware CSV using the unified drug-disease schema.
-
-Source interpretation
----------------------
-ChEMBL drug_indication records represent curated drug indication / clinical-phase evidence.
-They should be interpreted separately from AACT/ClinicalTrials.gov trial co-occurrence records.
-
-Input source
-------------
-ChEMBL FTP latest directory:
-    https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/latest/
-
-Main table used:
-    drug_indication
-
-Optional joined tables:
-    molecule_dictionary
-    disease_dictionary
-
-Unified output columns
-----------------------
-drug_name
-drug_identifier
-drug_identifier_type
-disease_or_condition_name
-disease_or_condition_identifier
-disease_or_condition_identifier_type
-relationship_type
-evidence_type
-source
-internal_source
-
-ChEMBL-specific metadata columns
---------------------------------
-drug_id
-disease_id
-disease_name
-mesh_id
-mesh_heading
-max_phase
-
-Requirements
-------------
-pip install pandas requests
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -73,7 +24,7 @@ import json
 import re
 import sqlite3
 import tarfile
-import tempfile
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urljoin
@@ -83,13 +34,33 @@ import requests
 
 
 # ============================================================
-# CONFIG
+# PATHS AND SOURCE CONFIGURATION
 # ============================================================
 
-BASE_URL = "https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/latest/"
+ROOT = Path(__file__).resolve().parent
+
+RAW = ROOT / "data/raw/chembl"
+
+OUT = ROOT / "data/processed/chembl_drug_disease.csv"
+
+META = (
+    ROOT
+    / "data/metadata/chembl_processing_metadata.json"
+)
+
+BASE_URL = (
+    "https://ftp.ebi.ac.uk/pub/databases/chembl/"
+    "ChEMBLdb/releases/chembl_37/"
+)
+
+ARCHIVE_NAME = "chembl_37_sqlite.tar.gz"
 
 
-UNIFIED_OUTPUT_COLUMNS = [
+# ============================================================
+# UNIFIED MERGE-COMPATIBLE SCHEMA
+# ============================================================
+
+CORE = [
     "drug_name",
     "drug_identifier",
     "drug_identifier_type",
@@ -100,964 +71,1789 @@ UNIFIED_OUTPUT_COLUMNS = [
     "evidence_type",
     "source",
     "internal_source",
+]
+
+EXTRA = [
     "drug_id",
     "disease_id",
     "disease_name",
     "mesh_id",
     "mesh_heading",
-    "max_phase",
+    "max_phase_for_indication",
+    "molecule_max_phase",
+    "drugind_id",
+    "record_id",
+    "molregno",
+    "efo_term",
+    "indication_ref_types",
+    "indication_ref_count",
+    "indication_refs_original_json",
+    "drug_name_lookup_status",
+    "disease_name_lookup_status",
 ]
 
+for entity in ("drug", "disease", "mesh"):
+    EXTRA += [
+        f"{entity}_identifier_{k}"
+        for k in (
+            "original",
+            "namespace",
+            "canonical",
+            "validation",
+        )
+    ]
+
+COLS = CORE + EXTRA
+
 
 # ============================================================
-# GENERAL HELPERS
+# GENERAL UTILITIES
 # ============================================================
 
-def now_utc() -> str:
+def now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def print_section(title: str) -> None:
-    print("\n" + "=" * 100)
-    print(title)
-    print("=" * 100)
+def section(title):
+    print(
+        "\n" + "=" * 92
+        + "\n" + title
+        + "\n" + "=" * 92,
+        flush=True,
+    )
 
 
-def human_size(num_bytes: int) -> str:
-    size = float(num_bytes)
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if size < 1024:
-            return f"{size:.2f} {unit}"
-        size /= 1024
-    return f"{size:.2f} PB"
-
-
-def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+def sha256(path):
     h = hashlib.sha256()
 
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(chunk_size), b""):
-            h.update(chunk)
+    with Path(path).open("rb") as fh:
+        for part in iter(
+            lambda: fh.read(4 * 1024 * 1024),
+            b"",
+        ):
+            h.update(part)
 
     return h.hexdigest()
 
 
-def download_file(
-    url: str,
-    out_path: Path,
-    force: bool = False,
-    timeout: int = 1200,
-) -> Path:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+def clean(x):
+    if x is None or pd.isna(x):
+        return ""
 
-    if out_path.exists() and out_path.stat().st_size > 0 and not force:
-        print(f"[CACHE] {out_path}")
-        print(f"        Size:   {human_size(out_path.stat().st_size)}")
-        print(f"        SHA256: {sha256_file(out_path)}")
-        return out_path
-
-    print(f"[DOWNLOAD] {url}")
-
-    tmp = out_path.with_suffix(out_path.suffix + ".part")
-
-    with requests.get(url, stream=True, timeout=timeout) as r:
-        r.raise_for_status()
-
-        with open(tmp, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    f.write(chunk)
-
-    tmp.replace(out_path)
-
-    print(f"[DOWNLOADED] {out_path}")
-    print(f"             Size:   {human_size(out_path.stat().st_size)}")
-    print(f"             SHA256: {sha256_file(out_path)}")
-
-    return out_path
+    return str(x).strip()
 
 
-def fetch_text(url: str, timeout: int = 120) -> str:
-    r = requests.get(url, timeout=timeout)
-    r.raise_for_status()
-    return r.text
+def phase(x):
+    s = clean(x)
 
+    if not s:
+        return ""
 
-def clean_text_series(s: pd.Series) -> pd.Series:
-    return s.fillna("").astype(str).str.strip()
+    try:
+        n = float(s)
 
-
-# ============================================================
-# ChEMBL LATEST DETECTION
-# ============================================================
-
-def find_latest_sqlite_filename(base_url: str = BASE_URL) -> tuple[str, str]:
-    """
-    Finds the latest chembl_XX_sqlite.tar.gz from the ChEMBL latest directory.
-
-    Returns:
-        filename, version
-        e.g. ("chembl_36_sqlite.tar.gz", "36")
-    """
-    print_section("1. Detecting latest ChEMBL SQLite archive")
-
-    html = fetch_text(base_url)
-    matches = re.findall(r'href="(chembl_(\d+)_sqlite\.tar\.gz)"', html)
-
-    if not matches:
-        raise RuntimeError(
-            f"Could not find chembl_XX_sqlite.tar.gz in {base_url}. "
-            "Check the FTP directory format."
+        return (
+            str(int(n))
+            if n.is_integer()
+            else str(n)
         )
 
-    matches = sorted(matches, key=lambda x: int(x[1]), reverse=True)
-    filename, version = matches[0]
-
-    print(f"[LATEST SQLITE] {filename}")
-    print(f"[VERSION] ChEMBL {version}")
-    print(f"[URL] {urljoin(base_url, filename)}")
-
-    return filename, version
+    except ValueError:
+        return s
 
 
-def expected_files_for_version(version: str) -> list[str]:
+def sql_cols(conn, table):
     return [
-        "checksums.txt",
-        "LICENSE",
-        "README",
-        "REQUIRED.ATTRIBUTION",
-        f"chembl_{version}_release_notes.txt",
-        "schema_documentation.txt",
+        x[1]
+        for x in conn.execute(
+            f"PRAGMA table_info({table})"
+        )
     ]
 
 
-def parse_checksums(checksums_path: Path) -> dict[str, str]:
-    """
-    Parse ChEMBL checksums file.
-
-    Expected patterns include:
-        <sha256>  <filename>
-    """
-    checksums: dict[str, str] = {}
-
-    if not checksums_path.exists():
-        return checksums
-
-    with open(checksums_path, "r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            line = line.strip()
-
-            if not line or line.startswith("#"):
-                continue
-
-            parts = re.split(r"\s+", line)
-
-            if len(parts) < 2:
-                continue
-
-            sha = None
-            fname = None
-
-            for p in parts:
-                if re.fullmatch(r"[a-fA-F0-9]{64}", p):
-                    sha = p.lower()
-                elif (
-                    "chembl_" in p
-                    or p in {
-                        "LICENSE",
-                        "README",
-                        "REQUIRED.ATTRIBUTION",
-                        "schema_documentation.txt",
-                    }
-                ):
-                    fname = Path(p).name
-
-            if sha and fname:
-                checksums[fname] = sha
-
-    return checksums
-
-
-def verify_checksum_if_available(path: Path, checksums: dict[str, str]) -> dict:
-    actual = sha256_file(path)
-    expected = checksums.get(path.name)
-
-    result = {
-        "file": path.name,
-        "actual_sha256": actual,
-        "expected_sha256": expected,
-        "verified": None,
+def tables(conn):
+    return {
+        x[0]
+        for x in conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table'"
+        )
     }
 
-    if expected is None:
-        print(f"[CHECKSUM] No expected SHA256 found for {path.name}; actual={actual}")
-        result["verified"] = "not_available"
-        return result
 
-    if actual.lower() != expected.lower():
-        result["verified"] = False
+# ============================================================
+# IDENTIFIER NORMALISATION
+# ============================================================
 
-        raise RuntimeError(
-            f"Checksum mismatch for {path.name}\n"
-            f"Expected: {expected}\n"
-            f"Actual:   {actual}"
+def normalise_id(value, declared=""):
+    """
+    Validate identifier syntax and optionally create
+    a canonical CURIE.
+
+    This does not establish ontology equivalence.
+    Original identifier values are never overwritten.
+    """
+
+    raw = clean(value)
+
+    if not raw:
+        return "", "", "missing"
+
+    token = raw.upper().replace(" ", "")
+    declared = declared.upper()
+
+    if (
+        declared == "CHEMBL"
+        or token.startswith("CHEMBL")
+    ):
+        m = re.fullmatch(
+            r"(?:CHEMBL:)?(CHEMBL\d+)",
+            token,
         )
 
-    print(f"[CHECKSUM PASS] {path.name}")
-    result["verified"] = True
+        if m:
+            return (
+                "ChEMBL",
+                f"CHEMBL:{m[1]}",
+                "syntax_valid",
+            )
 
-    return result
+        return (
+            "ChEMBL",
+            "",
+            "invalid_syntax",
+        )
 
+    if (
+        declared == "MESH"
+        or token.startswith("MESH:")
+    ):
+        token = token.removeprefix("MESH:")
 
-# ============================================================
-# TAR EXTRACTION
-# ============================================================
+        if re.fullmatch(
+            r"[CD]\d{6,9}",
+            token,
+        ):
+            return (
+                "MeSH",
+                "MESH:" + token,
+                "syntax_valid",
+            )
 
-def inspect_tar_and_find_sqlite(tar_path: Path) -> tarfile.TarInfo:
-    print_section("3. Inspecting ChEMBL SQLite tar.gz")
+        return (
+            "MeSH",
+            "",
+            "invalid_syntax",
+        )
 
-    with tarfile.open(tar_path, "r:gz") as tar:
-        members = tar.getmembers()
-
-    print(f"[TAR MEMBERS] {len(members):,}")
-    print("[FIRST 30 MEMBERS]")
-
-    for m in members[:30]:
-        print(f"  - {m.name} | {human_size(m.size)}")
-
-    candidates = []
-
-    for m in members:
-        if not m.isfile():
-            continue
-
-        lname = m.name.lower()
-
-        if lname.endswith((".db", ".sqlite", ".sqlite3")):
-            candidates.append(m)
-
-    if not candidates:
-        raise RuntimeError("No .db/.sqlite/.sqlite3 file found in ChEMBL archive.")
-
-    candidates.sort(key=lambda x: x.size, reverse=True)
-    chosen = candidates[0]
-
-    print(f"[SELECTED SQLITE MEMBER] {chosen.name}")
-    print(f"[SQLITE SIZE IN TAR] {human_size(chosen.size)}")
-
-    return chosen
-
-
-def extract_sqlite_member(
-    tar_path: Path,
-    member: tarfile.TarInfo,
-    out_dir: Path,
-    force: bool = False,
-) -> Path:
-    print_section("4. Extracting SQLite database")
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / Path(member.name).name
-
-    if out_path.exists() and out_path.stat().st_size > 0 and not force:
-        print(f"[CACHE] Using extracted DB: {out_path}")
-        print(f"        Size:   {human_size(out_path.stat().st_size)}")
-        print(f"        SHA256: {sha256_file(out_path)}")
-        return out_path
-
-    with tarfile.open(tar_path, "r:gz") as tar:
-        src = tar.extractfile(member)
-
-        if src is None:
-            raise RuntimeError(f"Could not open tar member: {member.name}")
-
-        tmp = out_path.with_suffix(out_path.suffix + ".part")
-
-        with open(tmp, "wb") as f:
-            while True:
-                chunk = src.read(1024 * 1024)
-
-                if not chunk:
-                    break
-
-                f.write(chunk)
-
-        tmp.replace(out_path)
-
-    print(f"[EXTRACTED] {out_path}")
-    print(f"            Size:   {human_size(out_path.stat().st_size)}")
-    print(f"            SHA256: {sha256_file(out_path)}")
-
-    return out_path
-
-
-# ============================================================
-# SQLITE HELPERS
-# ============================================================
-
-def table_exists(conn: sqlite3.Connection, table: str) -> bool:
-    q = "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1;"
-    return conn.execute(q, (table,)).fetchone() is not None
-
-
-def get_columns(conn: sqlite3.Connection, table: str) -> list[str]:
-    df = pd.read_sql_query(f"PRAGMA table_info({table});", conn)
-    return df["name"].astype(str).tolist()
-
-
-def choose_first_present(cols: set[str], *candidates: str) -> str | None:
-    for c in candidates:
-        if c in cols:
-            return c
-    return None
-
-
-def inspect_database(conn: sqlite3.Connection, head_n: int = 5) -> dict:
-    print_section("5. Inspecting ChEMBL database tables")
-
-    tables = pd.read_sql_query(
-        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;",
-        conn,
-    )["name"].astype(str).tolist()
-
-    print(f"[TABLE COUNT] {len(tables):,}")
-    print("[FIRST 60 TABLES]")
-
-    for t in tables[:60]:
-        print(f"  - {t}")
-
-    required_tables = ["drug_indication"]
-    useful_tables = [
-        "drug_indication",
-        "molecule_dictionary",
-        "disease_dictionary",
+    patterns = [
+        (
+            "EFO",
+            "EFO",
+            r"EFO[:_](\d+)",
+            7,
+        ),
+        (
+            "MONDO",
+            "MONDO",
+            r"MONDO[:_](\d+)",
+            7,
+        ),
+        (
+            "HP",
+            "HPO",
+            r"HP[:_](\d+)",
+            7,
+        ),
+        (
+            "DOID",
+            "DOID",
+            r"DOID[:_](\d+)",
+            0,
+        ),
+        (
+            "ORPHA",
+            "Orphanet",
+            r"(?:ORPHA|ORPHANET)[:_](\d+)",
+            0,
+        ),
+        (
+            "OMIM",
+            "OMIM",
+            r"OMIM[:_](\d+)",
+            0,
+        ),
+        (
+            "UMLS",
+            "UMLS",
+            r"(?:UMLS:)?(C\d{7,9})",
+            0,
+        ),
     ]
 
-    for t in required_tables:
-        if t not in tables:
-            raise RuntimeError(f"Required table missing: {t}")
+    for prefix, label, pat, width in patterns:
 
-    metadata = {
-        "table_count": len(tables),
-        "tables_preview": tables[:100],
-        "inspected_tables": {},
-    }
-
-    for t in useful_tables:
-        if t not in tables:
-            print(f"[WARN] Table not found: {t}")
-            continue
-
-        cols = get_columns(conn, t)
-
-        row_count = int(
-            pd.read_sql_query(
-                f"SELECT COUNT(*) AS n FROM {t};",
-                conn,
-            )["n"].iloc[0]
+        candidate = token.startswith(
+            (
+                prefix + ":",
+                prefix + "_",
+            )
         )
 
-        head = pd.read_sql_query(f"SELECT * FROM {t} LIMIT {head_n};", conn)
+        if (
+            prefix == "UMLS"
+            and re.fullmatch(
+                r"C\d{7,9}",
+                token,
+            )
+        ):
+            candidate = True
 
-        print("\n" + "-" * 100)
-        print(f"[TABLE] {t}")
-        print(f"[ROWS] {row_count:,}")
-        print(f"[COLUMNS] {cols}")
-        print("[HEAD]")
-        print(head.to_string(index=False))
+        if (
+            prefix == "ORPHA"
+            and token.startswith("ORPHANET")
+        ):
+            candidate = True
 
-        metadata["inspected_tables"][t] = {
-            "row_count": row_count,
-            "columns": cols,
-            "head_preview": head.to_dict(orient="records"),
-        }
+        if not candidate:
+            continue
 
-    return metadata
+        m = re.fullmatch(pat, token)
 
+        if m:
+            digits = (
+                m[1].zfill(width)
+                if width
+                else m[1]
+            )
 
-# ============================================================
-# SQL BUILDER
-# ============================================================
+            return (
+                label,
+                f"{prefix}:{digits}",
+                "syntax_valid",
+            )
 
-def build_chembl_drug_indication_sql(conn: sqlite3.Connection) -> str:
-    """
-    Build a schema-aware SQL query for ChEMBL drug_indication.
+        return (
+            label,
+            "",
+            "invalid_syntax",
+        )
 
-    Handles version differences where possible.
-    """
-    if not table_exists(conn, "drug_indication"):
-        raise RuntimeError("Missing required table: drug_indication")
-
-    di_cols = set(get_columns(conn, "drug_indication"))
-
-    md_exists = table_exists(conn, "molecule_dictionary")
-    md_cols = set(get_columns(conn, "molecule_dictionary")) if md_exists else set()
-
-    dd_exists = table_exists(conn, "disease_dictionary")
-    dd_cols = set(get_columns(conn, "disease_dictionary")) if dd_exists else set()
-
-    # -----------------------------
-    # Drug identifier and join logic
-    # -----------------------------
-    drug_join = None
-    drug_id_expr = None
-
-    if "molecule_chembl_id" in di_cols:
-        drug_id_expr = "di.molecule_chembl_id"
-
-        if md_exists and "molecule_chembl_id" in md_cols:
-            drug_join = "di.molecule_chembl_id = md.molecule_chembl_id"
-
-    if (
-        drug_id_expr is None
-        and "molecule_id" in di_cols
-        and md_exists
-        and "molecule_id" in md_cols
-    ):
-        drug_join = "di.molecule_id = md.molecule_id"
-
-        if "molecule_chembl_id" in md_cols:
-            drug_id_expr = "md.molecule_chembl_id"
-        else:
-            drug_id_expr = "CAST(md.molecule_id AS TEXT)"
-
-    if (
-        drug_id_expr is None
-        and "molregno" in di_cols
-        and md_exists
-        and "molregno" in md_cols
-    ):
-        drug_join = "di.molregno = md.molregno"
-
-        if "chembl_id" in md_cols:
-            drug_id_expr = "md.chembl_id"
-        elif "molecule_chembl_id" in md_cols:
-            drug_id_expr = "md.molecule_chembl_id"
-        else:
-            drug_id_expr = "CAST(md.molregno AS TEXT)"
-
-    if drug_id_expr is None:
-        if "molecule_chembl_id" in di_cols:
-            drug_id_expr = "di.molecule_chembl_id"
-        elif "molecule_id" in di_cols:
-            drug_id_expr = "CAST(di.molecule_id AS TEXT)"
-        elif "molregno" in di_cols:
-            drug_id_expr = "CAST(di.molregno AS TEXT)"
-        else:
-            drug_id_expr = "''"
-
-    # -----------------------------
-    # Drug name
-    # -----------------------------
-    if md_exists and "pref_name" in md_cols:
-        drug_name_expr = "COALESCE(md.pref_name, '')"
-    elif "molecule_pref_name" in di_cols:
-        drug_name_expr = "COALESCE(di.molecule_pref_name, '')"
-    else:
-        drug_name_expr = "''"
-
-    # -----------------------------
-    # Disease identifier and name
-    # -----------------------------
-    disease_id_expr = "di.efo_id" if "efo_id" in di_cols else "''"
-    di_efo_term = "di.efo_term" if "efo_term" in di_cols else "''"
-
-    disease_join = None
-
-    if dd_exists and "efo_id" in di_cols and "efo_id" in dd_cols:
-        disease_join = "di.efo_id = dd.efo_id"
-
-        if "pref_name" in dd_cols:
-            disease_name_expr = f"COALESCE(dd.pref_name, {di_efo_term}, '')"
-        else:
-            disease_name_expr = f"COALESCE({di_efo_term}, '')"
-    else:
-        disease_name_expr = f"COALESCE({di_efo_term}, '')"
-
-    # -----------------------------
-    # MeSH and phase fields
-    # -----------------------------
-    mesh_id_expr = "di.mesh_id" if "mesh_id" in di_cols else "''"
-    mesh_heading_expr = "di.mesh_heading" if "mesh_heading" in di_cols else "''"
-
-    phase_col = choose_first_present(
-        di_cols,
-        "max_phase_for_ind",
-        "max_phase",
-        "max_phase_for_indication",
+    return (
+        "unresolved",
+        "",
+        "unrecognised_namespace",
     )
 
-    phase_expr = f"di.{phase_col}" if phase_col else "0"
+
+def annotate(
+    df,
+    column,
+    entity,
+    declared="",
+):
+    mapped = [
+        normalise_id(v, declared)
+        for v in df[column].tolist()
+    ]
+
+    df[f"{entity}_identifier_original"] = (
+        df[column]
+    )
+
+    df[f"{entity}_identifier_namespace"] = [
+        m[0] for m in mapped
+    ]
+
+    df[f"{entity}_identifier_canonical"] = [
+        m[1] for m in mapped
+    ]
+
+    df[f"{entity}_identifier_validation"] = [
+        m[2] for m in mapped
+    ]
+
+    return df
+
+
+# ============================================================
+# DOWNLOAD AND ARCHIVE HANDLING
+# ============================================================
+
+def ensure_archive(
+    path,
+    url,
+    allow_download,
+    force_download=False,
+):
+    if (
+        path.is_file()
+        and path.stat().st_size
+        and not force_download
+    ):
+        print(
+            f"[REUSE PINNED ARCHIVE] {path}"
+        )
+
+        return
+
+    if not allow_download:
+        raise FileNotFoundError(
+            f"Missing {path}; "
+            "use --download_missing if needed"
+        )
+
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    tmp = path.with_name(
+        path.name + ".part"
+    )
+
+    try:
+        with requests.get(
+            url,
+            stream=True,
+            timeout=3600,
+        ) as response:
+
+            response.raise_for_status()
+
+            with tmp.open("wb") as output:
+                for part in response.iter_content(
+                    4 * 1024 * 1024
+                ):
+                    if part:
+                        output.write(part)
+
+        if not tmp.stat().st_size:
+            raise ValueError(
+                "Downloaded archive is empty"
+            )
+
+        tmp.replace(path)
+
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def extract_db(
+    archive,
+    directory,
+    force=False,
+):
+    section(
+        "2. COMPRESSED ARCHIVE CONTENTS "
+        "/ SQLITE EXTRACTION"
+    )
+
+    with tarfile.open(
+        archive,
+        "r:gz",
+    ) as tar:
+
+        members = tar.getmembers()
+
+        print(
+            f"TAR member count: {len(members):,}"
+        )
+
+        for member in members:
+            if member.isfile():
+                print(
+                    f"  {member.name} | "
+                    f"{member.size:,} bytes"
+                )
+
+        candidates = [
+            m for m in members
+            if m.isfile()
+            and m.name.lower().endswith(
+                (
+                    ".db",
+                    ".sqlite",
+                    ".sqlite3",
+                )
+            )
+        ]
+
+        if not candidates:
+            raise RuntimeError(
+                "Archive has no SQLite database file"
+            )
+
+        member = max(
+            candidates,
+            key=lambda m: m.size,
+        )
+
+        directory.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        dest = (
+            directory
+            / Path(member.name).name
+        )
+
+        if (
+            dest.exists()
+            and dest.stat().st_size == member.size
+            and not force
+        ):
+            print(
+                f"[REUSE EXTRACTED SQLITE] {dest}"
+            )
+
+            return dest, member.name
+
+        tmp = dest.with_name(
+            dest.name + ".part"
+        )
+
+        try:
+            src = tar.extractfile(member)
+
+            if src is None:
+                raise RuntimeError(
+                    "Cannot extract selected "
+                    "SQLite member"
+                )
+
+            with src, tmp.open("wb") as target:
+
+                while True:
+                    block = src.read(
+                        4 * 1024 * 1024
+                    )
+
+                    if not block:
+                        break
+
+                    target.write(block)
+
+            if (
+                tmp.stat().st_size
+                != member.size
+            ):
+                raise RuntimeError(
+                    "Extracted database "
+                    "size mismatch"
+                )
+
+            tmp.replace(dest)
+
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    print(f"[EXTRACTED] {dest}")
+
+    return dest, member.name
+
+
+# ============================================================
+# SQLITE SCHEMA INSPECTION
+# ============================================================
+
+def inspect_schema(conn, n=3):
+
+    section(
+        "3. SQLITE TABLES, ORIGINAL "
+        "COLUMNS AND ROW COUNTS"
+    )
+
+    available = tables(conn)
+
+    print(
+        f"SQLite tables: {len(available):,}"
+    )
+
+    required = {
+        "drug_indication": {
+            "drugind_id",
+            "molregno",
+            "efo_id",
+            "efo_term",
+            "max_phase_for_ind",
+        },
+        "molecule_dictionary": {
+            "molregno",
+            "chembl_id",
+            "pref_name",
+        },
+    }
+
+    for table, cols in required.items():
+
+        if table not in available:
+            raise RuntimeError(
+                "Missing required ChEMBL 37 "
+                f"table: {table}"
+            )
+
+        missing = (
+            cols
+            - set(sql_cols(conn, table))
+        )
+
+        if missing:
+            raise RuntimeError(
+                f"{table} missing columns: "
+                f"{sorted(missing)}"
+            )
+
+    counts = {}
+    headers = {}
+
+    selected_tables = (
+        "drug_indication",
+        "molecule_dictionary",
+        "indication_refs",
+        "disease_dictionary",
+    )
+
+    for table in selected_tables:
+
+        if table not in available:
+            print(
+                f"  {table}: NOT PRESENT"
+            )
+            continue
+
+        headers[table] = sql_cols(
+            conn,
+            table,
+        )
+
+        counts[table] = conn.execute(
+            f"SELECT COUNT(*) FROM {table}"
+        ).fetchone()[0]
+
+        print(
+            f"  {table}: "
+            f"{counts[table]:,} rows | "
+            f"{len(headers[table])} columns"
+        )
+
+        print(
+            "    "
+            + " | ".join(headers[table])
+        )
+
+        if n:
+            rows = conn.execute(
+                f"SELECT * FROM {table} LIMIT ?",
+                (n,),
+            ).fetchall()
+
+            if rows:
+                print(
+                    "    Sample:",
+                    dict(
+                        zip(
+                            headers[table],
+                            rows[0],
+                        )
+                    ),
+                )
+
+    return counts, headers
+
+
+# ============================================================
+# SQL JOINS
+# ============================================================
+
+def sql_builder(headers):
+
+    di = set(
+        headers["drug_indication"]
+    )
+
+    md = set(
+        headers["molecule_dictionary"]
+    )
+
+    has_dd = (
+        "disease_dictionary" in headers
+        and "efo_id"
+        in headers["disease_dictionary"]
+    )
+
+    dd_cols = set(
+        headers.get(
+            "disease_dictionary",
+            [],
+        )
+    )
+
+    ref_id = (
+        "di.record_id"
+        if "record_id" in di
+        else "NULL"
+    )
+
+    mesh_id = (
+        "di.mesh_id"
+        if "mesh_id" in di
+        else "NULL"
+    )
+
+    mesh_label = (
+        "di.mesh_heading"
+        if "mesh_heading" in di
+        else "NULL"
+    )
+
+    mol_phase = (
+        "md.max_phase"
+        if "max_phase" in md
+        else "NULL"
+    )
+
+    dd_label = (
+        "dd.pref_name"
+        if (
+            has_dd
+            and "pref_name" in dd_cols
+        )
+        else "NULL"
+    )
+
+    dd_join = (
+        "LEFT JOIN disease_dictionary dd "
+        "ON dd.efo_id = di.efo_id"
+        if has_dd
+        else ""
+    )
 
     sql = f"""
         SELECT
-            {drug_id_expr} AS drug_id,
-            {drug_name_expr} AS drug_name,
-            {disease_id_expr} AS disease_id,
-            {disease_name_expr} AS disease_name,
-            {mesh_id_expr} AS mesh_id,
-            {mesh_heading_expr} AS mesh_heading,
-            {phase_expr} AS max_phase
+            di.drugind_id AS drugind_id,
+            {ref_id} AS record_id,
+            di.molregno AS molregno,
+
+            md.chembl_id AS drug_id,
+            md.pref_name AS preferred_name,
+
+            di.efo_id AS disease_id,
+            di.efo_term AS efo_term,
+
+            {dd_label}
+                AS dictionary_disease_name,
+
+            {mesh_id} AS mesh_id,
+            {mesh_label} AS mesh_heading,
+
+            di.max_phase_for_ind
+                AS max_phase_for_indication,
+
+            {mol_phase} AS molecule_max_phase
+
         FROM drug_indication di
+
+        LEFT JOIN molecule_dictionary md
+            ON di.molregno = md.molregno
+
+        {dd_join}
     """
 
-    if md_exists and drug_join:
-        sql += f"\nLEFT JOIN molecule_dictionary md ON {drug_join}\n"
+    return sql, {
+        "molecule_join":
+            "di.molregno = md.molregno",
 
-    if dd_exists and disease_join:
-        sql += f"LEFT JOIN disease_dictionary dd ON {disease_join}\n"
+        "disease_dictionary_joined":
+            bool(has_dd),
 
-    return sql
+        "indication_phase":
+            "drug_indication.max_phase_for_ind",
 
-
-# ============================================================
-# EXPORT
-# ============================================================
-
-def export_chembl_drug_disease(
-    conn: sqlite3.Connection,
-    out_csv: Path,
-    internal_source: str,
-    chunksize: int = 200_000,
-) -> dict:
-    print_section("6. Exporting ChEMBL drug-disease indication CSV")
-
-    sql = build_chembl_drug_indication_sql(conn)
-
-    print("[SQL USED]")
-    print(sql)
-
-    preview = pd.read_sql_query(sql + " LIMIT 10", conn)
-
-    print("\n[OUTPUT PREVIEW BEFORE CLEANING]")
-    print(preview.to_string(index=False))
-
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
-
-    if out_csv.exists():
-        out_csv.unlink()
-
-    total_before_filter = 0
-    total_after_filter = 0
-    wrote_header = False
-
-    missing_drug_name_before_filtering = 0
-    missing_disease_id_before_filtering = 0
-    missing_mesh_id_before_filtering = 0
-
-    for chunk in pd.read_sql_query(sql, conn, chunksize=chunksize):
-        total_before_filter += len(chunk)
-
-        for c in [
-            "drug_id",
-            "drug_name",
-            "disease_id",
-            "disease_name",
-            "mesh_id",
-            "mesh_heading",
-        ]:
-            chunk[c] = clean_text_series(chunk[c])
-
-        chunk["max_phase"] = (
-            pd.to_numeric(chunk["max_phase"], errors="coerce")
-            .fillna(0)
-            .astype(int)
-        )
-
-        missing_drug_name_before_filtering += int((chunk["drug_name"] == "").sum())
-        missing_disease_id_before_filtering += int((chunk["disease_id"] == "").sum())
-        missing_mesh_id_before_filtering += int((chunk["mesh_id"] == "").sum())
-
-        # Keep records with a drug identifier and a disease/condition name.
-        # We do not require disease_id because some versions/records may have usable disease names.
-        chunk = chunk[
-            (chunk["drug_id"] != "")
-            & (chunk["disease_name"] != "")
-        ].copy()
-
-        if len(chunk) == 0:
-            continue
-
-        # ------------------------------------------------------------
-        # Unified schema columns
-        # ------------------------------------------------------------
-        chunk["drug_identifier"] = chunk["drug_id"]
-        chunk["drug_identifier_type"] = "ChEMBL"
-
-        chunk["disease_or_condition_name"] = chunk["disease_name"]
-        chunk["disease_or_condition_identifier"] = chunk["disease_id"]
-        chunk["disease_or_condition_identifier_type"] = chunk["disease_id"].apply(
-            lambda x: "EFO" if str(x).strip() else ""
-        )
-
-        chunk["relationship_type"] = "drug_indication"
-        chunk["evidence_type"] = "curated_drug_indication"
-
-        chunk["source"] = "ChEMBL"
-        chunk["internal_source"] = internal_source
-
-        chunk = chunk[UNIFIED_OUTPUT_COLUMNS]
-
-        # Remove exact duplicate rows inside chunk.
-        # Global exact duplicates are checked after writing.
-        chunk = chunk.drop_duplicates()
-
-        chunk.to_csv(
-            out_csv,
-            mode="a",
-            header=(not wrote_header),
-            index=False,
-        )
-
-        wrote_header = True
-        total_after_filter += len(chunk)
-
-        print(f"[WRITE] {total_after_filter:,} rows -> {out_csv}")
-
-    if not out_csv.exists() or out_csv.stat().st_size == 0:
-        raise RuntimeError("Output CSV was not created or is empty.")
-
-    output_head = pd.read_csv(out_csv, nrows=10, dtype=str)
-
-    full = pd.read_csv(
-        out_csv,
-        dtype=str,
-        low_memory=False,
-    ).fillna("")
-
-    exact_duplicate_rows = int(full.duplicated().sum())
-
-    unique_drug_disease_pairs = int(
-        full[
-            [
-                "drug_identifier",
-                "disease_or_condition_name",
-            ]
-        ]
-        .drop_duplicates()
-        .shape[0]
-    )
-
-    summary = {
-        "output_file": str(out_csv),
-        "output_size_bytes": out_csv.stat().st_size,
-        "output_sha256": sha256_file(out_csv),
-        "rows_before_filtering": int(total_before_filter),
-        "rows_after_filtering": int(len(full)),
-        "exact_duplicate_rows_in_output": exact_duplicate_rows,
-        "unique_drug_identifiers": int(full["drug_identifier"].nunique(dropna=True)),
-        "unique_drug_names": int(full["drug_name"].nunique(dropna=True)),
-        "unique_disease_identifiers": int(
-            full["disease_or_condition_identifier"].nunique(dropna=True)
-        ),
-        "unique_disease_names": int(
-            full["disease_or_condition_name"].nunique(dropna=True)
-        ),
-        "unique_drug_disease_pairs": unique_drug_disease_pairs,
-        "missing_drug_name_before_filtering": int(
-            missing_drug_name_before_filtering
-        ),
-        "missing_disease_id_before_filtering": int(
-            missing_disease_id_before_filtering
-        ),
-        "missing_mesh_id_before_filtering": int(
-            missing_mesh_id_before_filtering
-        ),
-        "relationship_type_counts": (
-            full["relationship_type"].value_counts().to_dict()
-            if len(full)
-            else {}
-        ),
-        "evidence_type_counts": (
-            full["evidence_type"].value_counts().to_dict()
-            if len(full)
-            else {}
-        ),
-        "max_phase_counts": (
-            full["max_phase"].value_counts().to_dict()
-            if len(full)
-            else {}
-        ),
-        "output_columns": list(full.columns),
-        "output_head": output_head.to_dict(orient="records"),
+        "molecule_phase":
+            mol_phase,
     }
 
-    print("\n[OUTPUT HEAD]")
-    print(output_head.to_string(index=False))
 
-    print("\n[OUTPUT SUMMARY]")
-    for k, v in summary.items():
-        if k != "output_head":
-            print(f"{k}: {v}")
+def validate_joins(
+    conn,
+    sql,
+    input_rows,
+):
 
-    return summary
+    section(
+        "4. JOIN CARDINALITY AND "
+        "SOURCE PROVENANCE CHECKS"
+    )
+
+    checks = {}
+
+    for table, key in (
+        (
+            "drug_indication",
+            "drugind_id",
+        ),
+        (
+            "molecule_dictionary",
+            "molregno",
+        ),
+    ):
+
+        checks[
+            table + "_duplicate_keys"
+        ] = conn.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM (
+                SELECT {key}
+                FROM {table}
+                GROUP BY {key}
+                HAVING COUNT(*) > 1
+            )
+            """
+        ).fetchone()[0]
+
+        if checks[
+            table + "_duplicate_keys"
+        ]:
+            raise RuntimeError(
+                "Non-unique primary join key: "
+                f"{table}.{key}"
+            )
+
+    checks["unmatched_molregno"] = (
+        conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM drug_indication di
+
+            LEFT JOIN molecule_dictionary md
+                ON md.molregno = di.molregno
+
+            WHERE md.molregno IS NULL
+            """
+        ).fetchone()[0]
+    )
+
+    checks["joined_rows"] = (
+        conn.execute(
+            f"SELECT COUNT(*) FROM ({sql})"
+        ).fetchone()[0]
+    )
+
+    for name, value in checks.items():
+        print(
+            f"  {name}: {value:,}"
+        )
+
+    if checks["joined_rows"] != input_rows:
+        raise RuntimeError(
+            "ChEMBL SQL join multiplied "
+            "or dropped source rows"
+        )
+
+    return checks
 
 
 # ============================================================
-# MAIN
+# INDICATION REFERENCES
 # ============================================================
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Download latest ChEMBL SQLite and export unified ChEMBL "
-            "drug-disease indication CSV."
+def references(
+    conn,
+    output_path,
+):
+
+    available = tables(conn)
+
+    if (
+        "indication_refs" not in available
+        or not {
+            "drugind_id",
+            "ref_type",
+        }.issubset(
+            sql_cols(
+                conn,
+                "indication_refs",
+            )
+        )
+    ):
+        print(
+            "[REFS] No compatible "
+            "indication_refs table"
+        )
+
+        return {}, 0, None
+
+    ref_cols = sql_cols(
+        conn,
+        "indication_refs",
+    )
+
+    query = (
+        "SELECT "
+        + ", ".join(
+            '"' + c + '"'
+            for c in ref_cols
+        )
+        + " FROM indication_refs"
+    )
+
+    grouped = defaultdict(list)
+    rows = 0
+
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    tmp = output_path.with_name(
+        output_path.name + ".tmp"
+    )
+
+    try:
+        with tmp.open(
+            "w",
+            encoding="utf-8",
+            newline="",
+        ) as handle:
+
+            import csv
+
+            writer = csv.writer(handle)
+            writer.writerow(ref_cols)
+
+            cur = conn.execute(query)
+
+            while batch := cur.fetchmany(10000):
+
+                for record in batch:
+
+                    writer.writerow(record)
+
+                    datum = dict(
+                        zip(
+                            ref_cols,
+                            record,
+                        )
+                    )
+
+                    key = clean(
+                        datum.get("drugind_id")
+                    )
+
+                    grouped[key].append(
+                        datum
+                    )
+
+                    rows += 1
+
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+    print(
+        f"[REFS] {rows:,} source reference "
+        f"records, {len(grouped):,} "
+        "indication IDs"
+    )
+
+    return grouped, rows, tmp
+
+
+# ============================================================
+# TRANSFORM ONE SQLITE CHUNK
+# ============================================================
+
+def transform(
+    chunk,
+    grouped,
+    internal_source,
+):
+
+    for field in chunk.columns:
+        chunk[field] = (
+            chunk[field].map(clean)
+        )
+
+    for field in (
+        "drugind_id",
+        "record_id",
+        "molregno",
+        "max_phase_for_indication",
+        "molecule_max_phase",
+    ):
+        chunk[field] = (
+            chunk[field].map(phase)
+        )
+
+    # Preferred drug name, when supplied.
+    original_name = chunk["preferred_name"]
+
+    chunk["drug_name_lookup_status"] = (
+        "preferred_name"
+    )
+
+    no_preferred = original_name.eq("")
+
+    chunk.loc[
+        no_preferred,
+        "drug_name_lookup_status",
+    ] = "identifier_placeholder"
+
+    # An identifier fallback is not a resolved name.
+    chunk["drug_name"] = (
+        original_name.where(
+            ~no_preferred,
+            chunk["drug_id"],
         )
     )
 
-    parser.add_argument(
-        "--base_url",
-        default=BASE_URL,
-        help="ChEMBL latest FTP directory URL.",
+    # Disease name selection and provenance.
+    chunk["disease_name_lookup_status"] = (
+        "efo_term"
     )
 
-    parser.add_argument(
+    disease = chunk["efo_term"].copy()
+
+    empty = disease.eq("")
+
+    dictionary = chunk[
+        "dictionary_disease_name"
+    ]
+
+    use_dict = (
+        empty
+        & dictionary.ne("")
+    )
+
+    disease = disease.mask(
+        use_dict,
+        dictionary,
+    )
+
+    chunk.loc[
+        use_dict,
+        "disease_name_lookup_status",
+    ] = "disease_dictionary"
+
+    empty = disease.eq("")
+
+    use_mesh = (
+        empty
+        & chunk["mesh_heading"].ne("")
+    )
+
+    disease = disease.mask(
+        use_mesh,
+        chunk["mesh_heading"],
+    )
+
+    chunk.loc[
+        use_mesh,
+        "disease_name_lookup_status",
+    ] = "mesh_heading_fallback"
+
+    empty = disease.eq("")
+
+    use_id = (
+        empty
+        & chunk["disease_id"].ne("")
+    )
+
+    disease = disease.mask(
+        use_id,
+        chunk["disease_id"],
+    )
+
+    chunk.loc[
+        use_id,
+        "disease_name_lookup_status",
+    ] = "identifier_placeholder"
+
+    chunk["disease_name"] = disease
+
+    # Unified identity fields.
+    chunk["drug_identifier"] = (
+        chunk["drug_id"]
+    )
+
+    chunk[
+        "disease_or_condition_identifier"
+    ] = chunk["disease_id"]
+
+    chunk[
+        "disease_or_condition_name"
+    ] = chunk["disease_name"]
+
+    chunk["relationship_type"] = (
+        "drug_indication"
+    )
+
+    chunk["evidence_type"] = (
+        "curated_drug_indication"
+    )
+
+    chunk["source"] = "ChEMBL"
+
+    chunk["internal_source"] = (
+        internal_source
+    )
+
+    # Validate namespaces separately from raw IDs.
+    for entity, field, namespace in (
+        (
+            "drug",
+            "drug_id",
+            "ChEMBL",
+        ),
+        (
+            "disease",
+            "disease_id",
+            "",
+        ),
+        (
+            "mesh",
+            "mesh_id",
+            "MeSH",
+        ),
+    ):
+
+        annotate(
+            chunk,
+            field,
+            entity,
+            namespace,
+        )
+
+    chunk["drug_identifier_type"] = (
+        chunk[
+            "drug_identifier_namespace"
+        ]
+    )
+
+    chunk[
+        "disease_or_condition_identifier_type"
+    ] = chunk[
+        "disease_identifier_namespace"
+    ]
+
+    # Add all indication references.
+    types = []
+    nums = []
+    refs_json = []
+
+    for row_id in chunk[
+        "drugind_id"
+    ].tolist():
+
+        items = grouped.get(
+            row_id,
+            [],
+        )
+
+        types.append(
+            "|".join(
+                sorted(
+                    {
+                        clean(
+                            x.get("ref_type")
+                        )
+                        for x in items
+                        if clean(
+                            x.get("ref_type")
+                        )
+                    }
+                )
+            )
+        )
+
+        nums.append(
+            str(len(items))
+        )
+
+        refs_json.append(
+            json.dumps(
+                items,
+                ensure_ascii=False,
+                default=str,
+            )
+        )
+
+    chunk[
+        "indication_ref_types"
+    ] = types
+
+    chunk[
+        "indication_ref_count"
+    ] = nums
+
+    chunk[
+        "indication_refs_original_json"
+    ] = refs_json
+
+    # Preserve all eligible source indication events.
+    eligible = (
+        chunk["drug_name"].ne("")
+        & chunk["disease_name"].ne("")
+    )
+
+    accepted = chunk.loc[
+        eligible,
+        COLS,
+    ].copy()
+
+    rejected = chunk.loc[
+        ~eligible
+    ].copy()
+
+    return accepted, rejected
+
+
+# ============================================================
+# MAIN PROCESSING
+# ============================================================
+
+def main():
+
+    p = argparse.ArgumentParser(
+        description=__doc__
+    )
+
+    p.add_argument(
         "--workdir",
-        default="./data/raw/chembl",
-        help="Directory for downloaded ChEMBL files.",
+        default=str(RAW),
     )
 
-    parser.add_argument(
+    p.add_argument(
         "--out",
-        default="./data/processed/chembl_drug_disease.csv",
-        help="Output CSV path.",
+        default=str(OUT),
     )
 
-    parser.add_argument(
+    p.add_argument(
         "--metadata",
-        default="./data/metadata/chembl_processing_metadata.json",
-        help="Metadata JSON path.",
+        default=str(META),
     )
 
-    parser.add_argument(
+    p.add_argument(
         "--input_archive",
         default=None,
-        help=(
-            "Optional existing chembl_XX_sqlite.tar.gz. "
-            "If provided, download is skipped for the archive."
-        ),
     )
 
-    parser.add_argument(
+    p.add_argument(
+        "--base_url",
+        default=BASE_URL,
+    )
+
+    p.add_argument(
+        "--download_missing",
+        action="store_true",
+    )
+
+    p.add_argument(
+        "--force_download",
+        action="store_true",
+    )
+
+    p.add_argument(
+        "--force_extract",
+        action="store_true",
+    )
+
+    p.add_argument(
         "--keep_db",
         action="store_true",
         help=(
-            "Keep extracted SQLite DB under workdir/extracted. "
-            "Otherwise use a temporary directory."
+            "Accepted for compatibility; "
+            "extracted DB is always cached"
         ),
     )
 
-    parser.add_argument(
-        "--force_download",
-        action="store_true",
-        help="Force re-download even if files exist.",
-    )
-
-    parser.add_argument(
-        "--force_extract",
-        action="store_true",
-        help="Force re-extraction of SQLite database.",
-    )
-
-    parser.add_argument(
+    p.add_argument(
         "--chunksize",
         type=int,
-        default=200_000,
-        help="Rows per SQL chunk.",
+        default=50000,
     )
 
-    parser.add_argument(
+    p.add_argument(
         "--head_n",
         type=int,
-        default=5,
-        help="Number of rows to print from table heads.",
+        default=2,
     )
 
-    args = parser.parse_args()
+    args = p.parse_args()
 
-    workdir = Path(args.workdir).resolve()
-    out_csv = Path(args.out).resolve()
-    metadata_path = Path(args.metadata).resolve()
-
-    workdir.mkdir(parents=True, exist_ok=True)
-
-    metadata = {
-        "script": "chembl_to_drug_disease.py",
-        "source": "ChEMBL",
-        "relationship_type": "drug_indication",
-        "evidence_type": "curated_drug_indication",
-        "base_url": args.base_url,
-        "started_at_utc": now_utc(),
-        "processing_interpretation": (
-            "ChEMBL drug_indication records are curated drug indication "
-            "records with clinical phase metadata. They are not equivalent "
-            "to AACT/ClinicalTrials.gov intervention-condition co-occurrence."
-        ),
-        "unified_schema_columns": UNIFIED_OUTPUT_COLUMNS,
-    }
-
-    try:
-        print_section("ChEMBL latest -> unified drug-disease indication CSV")
-
-        if args.input_archive:
-            archive_path = Path(args.input_archive).expanduser().resolve()
-
-            if not archive_path.exists():
-                raise FileNotFoundError(
-                    f"Input archive does not exist: {archive_path}"
-                )
-
-            match = re.search(
-                r"chembl_(\d+)_sqlite\.tar\.gz",
-                archive_path.name,
-            )
-
-            if not match:
-                raise ValueError(
-                    "Input archive name should look like chembl_36_sqlite.tar.gz "
-                    "so the ChEMBL version can be inferred."
-                )
-
-            version = match.group(1)
-            sqlite_filename = archive_path.name
-
-            print(f"[MANUAL ARCHIVE MODE] {archive_path}")
-
-        else:
-            sqlite_filename, version = find_latest_sqlite_filename(args.base_url)
-            archive_url = urljoin(args.base_url, sqlite_filename)
-            archive_path = workdir / sqlite_filename
-
-            # Download support files first.
-            print_section("2. Downloading ChEMBL support files")
-
-            support_files = expected_files_for_version(version)
-            downloaded_support = []
-
-            for fname in support_files:
-                url = urljoin(args.base_url, fname)
-                out_path = workdir / fname
-
-                try:
-                    download_file(
-                        url,
-                        out_path,
-                        force=args.force_download,
-                    )
-                    downloaded_support.append(str(out_path))
-
-                except Exception as e:
-                    print(f"[WARN] Could not download support file {fname}: {e}")
-
-            metadata["downloaded_support_files"] = downloaded_support
-
-            # Download main archive.
-            archive_path = download_file(
-                archive_url,
-                workdir / sqlite_filename,
-                force=args.force_download,
-                timeout=3600,
-            )
-
-        internal_source = f"ChEMBL{version}"
-
-        metadata["internal_source"] = internal_source
-        metadata["chembl_version"] = version
-        metadata["sqlite_archive"] = {
-            "filename": sqlite_filename,
-            "path": str(archive_path),
-            "size_bytes": archive_path.stat().st_size,
-            "sha256": sha256_file(archive_path),
-        }
-
-        # Checksum verification if checksums.txt exists.
-        checksum_results = []
-        checksums_path = workdir / "checksums.txt"
-
-        if checksums_path.exists():
-            checksums = parse_checksums(checksums_path)
-
-            print_section("Checksum verification")
-
-            checksum_results.append(
-                verify_checksum_if_available(
-                    archive_path,
-                    checksums,
-                )
-            )
-        else:
-            print(
-                "[WARN] checksums.txt not available; "
-                "skipping checksum verification against expected values."
-            )
-
-        metadata["checksum_verification"] = checksum_results
-
-        member = inspect_tar_and_find_sqlite(archive_path)
-
-        metadata["selected_sqlite_member"] = {
-            "name": member.name,
-            "size_bytes": member.size,
-        }
-
-        if args.keep_db:
-            extract_dir = workdir / "extracted"
-            temp_ctx = None
-        else:
-            temp_ctx = tempfile.TemporaryDirectory(prefix="chembl_sqlite_")
-            extract_dir = Path(temp_ctx.name)
-
-        db_path = extract_sqlite_member(
-            archive_path,
-            member,
-            extract_dir,
-            force=args.force_extract,
+    if args.chunksize < 1:
+        p.error(
+            "--chunksize must be positive"
         )
 
-        metadata["extracted_sqlite_db"] = {
-            "path": str(db_path),
-            "size_bytes": db_path.stat().st_size,
-            "sha256": sha256_file(db_path),
-        }
+    workdir = Path(
+        args.workdir
+    ).expanduser().resolve()
 
-        conn = sqlite3.connect(str(db_path))
+    out = Path(
+        args.out
+    ).expanduser().resolve()
 
-        try:
-            metadata["database_inspection"] = inspect_database(
-                conn,
-                head_n=args.head_n,
+    metadata_path = Path(
+        args.metadata
+    ).expanduser().resolve()
+
+    archive = (
+        Path(
+            args.input_archive
+        ).expanduser().resolve()
+        if args.input_archive
+        else workdir / ARCHIVE_NAME
+    )
+
+    m = re.fullmatch(
+        r"chembl_(\d+)_sqlite\.tar\.gz",
+        archive.name,
+    )
+
+    if not m:
+        raise ValueError(
+            "Archive must be named "
+            "chembl_XX_sqlite.tar.gz"
+        )
+
+    version = m[1]
+
+    if version != "37":
+        raise ValueError(
+            "This reproducible run is "
+            "locked to ChEMBL 37"
+        )
+
+    report = {
+        "started_at_utc": now(),
+        "source": "ChEMBL",
+        "chembl_release": version,
+        "status": "running",
+        "output_fields": COLS,
+    }
+
+    temp_csv = out.with_name(
+        out.name + ".processing.tmp"
+    )
+
+    ref_path = out.with_name(
+        "chembl_indication_refs.csv"
+    )
+
+    ref_temp = None
+
+    try:
+
+        # ------------------------------------------------
+        # STEP 1: SOURCE ARCHIVE
+        # ------------------------------------------------
+
+        section(
+            "1. INPUT FILE INVENTORY — "
+            "ChEMBL 37 LOCKED SNAPSHOT"
+        )
+
+        ensure_archive(
+            archive,
+            urljoin(
+                args.base_url.rstrip("/")
+                + "/",
+                archive.name,
+            ),
+            args.download_missing
+            or args.force_download,
+            args.force_download,
+        )
+
+        report[
+            "raw_file_inventory"
+        ] = []
+
+        for path in sorted(
+            x for x in workdir.rglob("*")
+            if x.is_file()
+        ):
+
+            report[
+                "raw_file_inventory"
+            ].append(
+                {
+                    "name": str(
+                        path.relative_to(workdir)
+                    ),
+                    "bytes": (
+                        path.stat().st_size
+                    ),
+                }
             )
 
-            metadata["processing"] = export_chembl_drug_disease(
-                conn=conn,
-                out_csv=out_csv,
-                internal_source=internal_source,
+            print(
+                f"  {path.relative_to(workdir)}"
+                f" | {path.stat().st_size:,} bytes"
+            )
+
+        report["archive"] = {
+            "path": str(archive),
+            "bytes": (
+                archive.stat().st_size
+            ),
+            "sha256": sha256(archive),
+        }
+
+        # ------------------------------------------------
+        # STEP 2: EXTRACT SQLITE
+        # ------------------------------------------------
+
+        db, member = extract_db(
+            archive,
+            workdir / "extracted",
+            args.force_extract,
+        )
+
+        report["sqlite_member"] = member
+        report["sqlite_path"] = str(db)
+
+        conn = sqlite3.connect(
+            f"file:{db}?mode=ro",
+            uri=True,
+        )
+
+        try:
+
+            # --------------------------------------------
+            # STEP 3: VERIFY SOURCE SCHEMA
+            # --------------------------------------------
+
+            counts, headers = inspect_schema(
+                conn,
+                args.head_n,
+            )
+
+            report[
+                "original_table_headers"
+            ] = headers
+
+            report[
+                "original_table_rows"
+            ] = counts
+
+            sql, mapping = sql_builder(
+                headers
+            )
+
+            report[
+                "sql_join_design"
+            ] = mapping
+
+            print(
+                "\n[SQL JOIN DESIGN]",
+                mapping,
+            )
+
+            print(
+                "FIELD MAPPING: "
+                "molecule_dictionary.chembl_id "
+                "-> drug_identifier"
+            )
+
+            print(
+                "FIELD MAPPING: "
+                "molecule_dictionary.pref_name "
+                "-> drug_name"
+            )
+
+            print(
+                "FIELD MAPPING: "
+                "drug_indication.efo_id/efo_term "
+                "-> disease ID/name"
+            )
+
+            print(
+                "FIELD MAPPING: "
+                "drug_indication.max_phase_for_ind "
+                "-> max_phase_for_indication"
+            )
+
+            # --------------------------------------------
+            # STEP 4: VERIFY JOIN
+            # --------------------------------------------
+
+            report["join_checks"] = (
+                validate_joins(
+                    conn,
+                    sql,
+                    counts["drug_indication"],
+                )
+            )
+
+            # --------------------------------------------
+            # STEP 5: PRESERVE REFERENCES
+            # --------------------------------------------
+
+            grouped, ref_rows, ref_temp = (
+                references(
+                    conn,
+                    ref_path,
+                )
+            )
+
+            report[
+                "reference_rows"
+            ] = ref_rows
+
+            out.parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            total = 0
+            exported = 0
+            excluded = 0
+
+            reason_counts = Counter()
+            name_counts = Counter()
+            disease_counts = Counter()
+            id_types = Counter()
+            phase_counts = Counter()
+
+            wrote = False
+
+            section(
+                "5. EXTRACTING SOURCE "
+                "INDICATION EVENTS"
+            )
+
+            for chunk in pd.read_sql_query(
+                sql,
+                conn,
                 chunksize=args.chunksize,
+            ):
+
+                total += len(chunk)
+
+                transformed, invalid = (
+                    transform(
+                        chunk,
+                        grouped,
+                        f"ChEMBL{version}",
+                    )
+                )
+
+                exported += len(transformed)
+                excluded += len(invalid)
+
+                for name in (
+                    invalid["drug_id"]
+                    .fillna("")
+                    .astype(str)
+                    .tolist()
+                ):
+                    reason_counts[
+                        "missing_drug_id"
+                    ] += (
+                        not name.strip()
+                    )
+
+                for name in (
+                    invalid["disease_name"]
+                    .fillna("")
+                    .astype(str)
+                    .tolist()
+                ):
+                    reason_counts[
+                        "missing_disease_name"
+                    ] += (
+                        not name.strip()
+                    )
+
+                name_counts.update(
+                    transformed[
+                        "drug_name_lookup_status"
+                    ].value_counts().to_dict()
+                )
+
+                disease_counts.update(
+                    transformed[
+                        "disease_name_lookup_status"
+                    ].value_counts().to_dict()
+                )
+
+                id_types.update(
+                    transformed[
+                        "disease_or_condition_identifier_type"
+                    ].value_counts().to_dict()
+                )
+
+                phase_counts.update(
+                    transformed[
+                        "max_phase_for_indication"
+                    ]
+                    .replace("", "NULL")
+                    .value_counts()
+                    .to_dict()
+                )
+
+                transformed.to_csv(
+                    temp_csv,
+                    mode="a",
+                    index=False,
+                    header=not wrote,
+                )
+
+                wrote = True
+
+                print(
+                    f"  Read {total:,}"
+                    f" -> eligible {exported:,}"
+                    f" | excluded {excluded:,}",
+                    flush=True,
+                )
+
+            # --------------------------------------------
+            # STEP 6: VALIDATE OUTPUT
+            # --------------------------------------------
+
+            if not wrote:
+                raise RuntimeError(
+                    "No eligible ChEMBL "
+                    "source records"
+                )
+
+            if (
+                total
+                != counts["drug_indication"]
+                or total != exported + excluded
+            ):
+                raise RuntimeError(
+                    "ChEMBL processing row "
+                    "accounting mismatch"
+                )
+
+            header = pd.read_csv(
+                temp_csv,
+                nrows=0,
+            ).columns.tolist()
+
+            if header != COLS:
+                raise RuntimeError(
+                    "Output fields differ "
+                    "from declared "
+                    "merge-compatible schema"
+                )
+
+            preview = pd.read_csv(
+                temp_csv,
+                nrows=min(
+                    3,
+                    args.head_n,
+                ),
+                dtype=str,
+            ).fillna("")
+
+            if exported == 0:
+                raise RuntimeError(
+                    "Zero records written"
+                )
+
+            section(
+                "6. VALIDATED OUTPUT ROWS, "
+                "SCHEMA AND SAMPLE"
+            )
+
+            print(
+                f"Original drug_indication: "
+                f"{total:,}"
+            )
+
+            print(
+                "Eligible merged-schema records: "
+                f"{exported:,}"
+            )
+
+            print(
+                "Excluded missing identity: "
+                f"{excluded:,}"
+            )
+
+            print(
+                f"Output fields ({len(COLS)}): "
+                + " | ".join(COLS)
+            )
+
+            print(
+                "[INDICATION PHASE]",
+                dict(phase_counts),
+            )
+
+            print(
+                "[DISEASE IDENTIFIER TYPES]",
+                dict(id_types),
+            )
+
+            print(
+                "[DRUG NAME RESOLUTION]",
+                dict(name_counts),
+            )
+
+            print(
+                "[DISEASE NAME RESOLUTION]",
+                dict(disease_counts),
+            )
+
+            if len(preview):
+                print(
+                    "[ONE REAL OUTPUT ROW]"
+                )
+
+                for field, value in (
+                    preview.iloc[0].items()
+                ):
+                    print(
+                        f"  {field:38} "
+                        f"{str(value)[:160]}"
+                    )
+
+            report.update(
+                {
+                    "rows_input": total,
+                    "rows_output": exported,
+                    "rows_excluded": excluded,
+
+                    "exclusion_reasons":
+                        dict(reason_counts),
+
+                    "drug_name_resolution":
+                        dict(name_counts),
+
+                    "disease_name_resolution":
+                        dict(disease_counts),
+
+                    "disease_namespace_counts":
+                        dict(id_types),
+
+                    "indication_phase_counts":
+                        dict(phase_counts),
+
+                    "relationship_type":
+                        "drug_indication",
+
+                    "evidence_type":
+                        "curated_drug_indication",
+
+                    "row_semantics":
+                        "Source indication evidence, "
+                        "not universal regulatory approval",
+                }
             )
 
         finally:
             conn.close()
 
-        if temp_ctx is not None:
-            temp_ctx.cleanup()
+        # ------------------------------------------------
+        # STEP 7: OVERWRITE IN THE SAME DIRECTORY
+        # ------------------------------------------------
 
-        metadata["finished_at_utc"] = now_utc()
-        metadata["status"] = "success"
+        temp_csv.replace(out)
 
-    except Exception as e:
-        metadata["finished_at_utc"] = now_utc()
-        metadata["status"] = "failed"
-        metadata["error"] = repr(e)
+        if ref_temp:
+            ref_temp.replace(
+                ref_path
+            )
+
+        report["output_file"] = str(out)
+
+        report[
+            "output_sha256"
+        ] = sha256(out)
+
+        report[
+            "references_csv"
+        ] = (
+            str(ref_path)
+            if ref_rows
+            else ""
+        )
+
+        report[
+            "finished_at_utc"
+        ] = now()
+
+        report["status"] = "success"
+
+        metadata_path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        summary_tmp = (
+            metadata_path.with_name(
+                metadata_path.name + ".tmp"
+            )
+        )
+
+        summary_tmp.write_text(
+            json.dumps(
+                report,
+                indent=2,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        summary_tmp.replace(
+            metadata_path
+        )
+
+        print(
+            f"\nSUCCESS: {out}"
+            f"\nSUMMARY: {metadata_path}"
+        )
+
+    except Exception as exc:
+
+        failure = (
+            metadata_path.with_name(
+                "chembl_failed_run.json"
+            )
+        )
+
+        failure.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        report.update(
+            {
+                "status": "failed",
+                "failure": repr(exc),
+                "finished_at_utc": now(),
+            }
+        )
+
+        failure.write_text(
+            json.dumps(
+                report,
+                indent=2,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
         raise
 
     finally:
-        metadata_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_csv.unlink(
+            missing_ok=True
+        )
 
-        with open(metadata_path, "w", encoding="utf-8") as f:
-            json.dump(metadata, f, indent=2)
-
-        print_section("METADATA WRITTEN")
-        print(metadata_path)
+        if ref_temp is not None:
+            ref_temp.unlink(
+                missing_ok=True
+            )
 
 
 if __name__ == "__main__":

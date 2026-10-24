@@ -1,73 +1,14 @@
+
 #!/usr/bin/env python3
+"""Open Targets Platform 26.03 clinical indications -> merge-compatible CSV.
+
+Read existing Parquet files, check all partitions against the official release
+listing (unless --offline), and overwrite original processed output only after
+successful validation. No downloads unless --download-missing is passed.
+
+Clinical indications aggregate clinical reports. Their evidence is not independent
+of underlying AACT, ChEMBL, EMA, PMDA, etc. APPROVAL != PHASE_4.
 """
-Open Targets Platform -> unified drug-disease mapping CSV
-
-Purpose
--------
-Download Open Targets Platform clinical_indication, drug_molecule,
-and disease parquet datasets, then export a publication-ready,
-provenance-aware drug-disease mapping CSV using the unified schema.
-
-Main dataset used
------------------
-clinical_indication
-
-Supporting datasets
--------------------
-drug_molecule
-disease
-
-Default Open Targets release
-----------------------------
-26.03
-
-Input base URL
---------------
-https://ftp.ebi.ac.uk/pub/databases/opentargets/platform
-
-Example release URLs
---------------------
-https://ftp.ebi.ac.uk/pub/databases/opentargets/platform/26.03/output/clinical_indication/
-https://ftp.ebi.ac.uk/pub/databases/opentargets/platform/26.03/output/drug_molecule/
-https://ftp.ebi.ac.uk/pub/databases/opentargets/platform/26.03/output/disease/
-
-Interpretation
---------------
-Open Targets clinical_indication rows represent drug-disease clinical
-indication evidence with clinical stage metadata. These records should not
-all be interpreted as approved indications; use max_phase / clinical_phase_raw
-to distinguish clinical stage.
-
-Unified output columns
-----------------------
-drug_name
-drug_identifier
-drug_identifier_type
-disease_or_condition_name
-disease_or_condition_identifier
-disease_or_condition_identifier_type
-relationship_type
-evidence_type
-source
-internal_source
-
-Open Targets-specific metadata columns
---------------------------------------
-drug_id
-disease_id
-disease_name
-max_phase
-clinical_phase_raw
-clinical_report_ids
-opentargets_indication_id
-dataset
-release
-
-Requirements
-------------
-pip install pandas pyarrow requests
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -75,785 +16,998 @@ import csv
 import hashlib
 import json
 import re
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urljoin, urlparse
 
-import pandas as pd
 import pyarrow.parquet as pq
 import requests
 
-
-# =============================================================================
-# Configuration
-# =============================================================================
-
+ROOT = Path(__file__).resolve().parent
 BASE = "https://ftp.ebi.ac.uk/pub/databases/opentargets/platform"
-DEFAULT_RELEASE = "26.03"
-UA = "Mozilla/5.0 (OpenTargetsDrugDiseaseExporter/2.0)"
+RELEASE = "26.03"
+DATASETS = ("clinical_indication", "drug_molecule", "disease")
 
-
-OUTPUT_COLUMNS = [
-    # Unified schema
-    "drug_name",
-    "drug_identifier",
-    "drug_identifier_type",
-    "disease_or_condition_name",
-    "disease_or_condition_identifier",
-    "disease_or_condition_identifier_type",
-    "relationship_type",
-    "evidence_type",
-    "source",
-    "internal_source",
-
-    # Open Targets-specific metadata
-    "drug_id",
-    "disease_id",
-    "disease_name",
-    "max_phase",
-    "clinical_phase_raw",
-    "clinical_report_ids",
-    "opentargets_indication_id",
-    "dataset",
-    "release",
+CORE = [
+    "drug_name", "drug_identifier", "drug_identifier_type",
+    "disease_or_condition_name", "disease_or_condition_identifier",
+    "disease_or_condition_identifier_type", "relationship_type", "evidence_type",
+    "source", "internal_source",
 ]
+META = [
+    "drug_id", "disease_id", "disease_name",
+    "max_clinical_stage_for_indication", "clinical_phase_raw",
+    "clinical_stage_validation", "clinical_phase_numeric",
+    "clinical_stage_is_explicit_approval", "clinical_report_ids",
+    "clinical_report_ids_original", "clinical_report_count",
+    "opentargets_indication_id", "drug_name_lookup_status",
+    "disease_name_lookup_status", "dataset", "release",
+    "opentargets_source_parquet", "opentargets_source_row_number",
+    "evidence_granularity",
+]
+for entity in ("drug", "disease"):
+    META += [f"{entity}_identifier_{suffix}" for suffix in
+             ("original", "namespace", "canonical", "validation")]
+COLUMNS = CORE + META
+REJECT_COLUMNS = ["source_parquet", "source_row_number", "indication_id",
+                  "drug_id", "disease_id", "rejection_reason"]
+
+STAGES = {
+    "UNKNOWN", "PRECLINICAL", "IND", "EARLY_PHASE_1", "PHASE_1",
+    "PHASE_1_2", "PHASE_2", "PHASE_2_3", "PHASE_3", "PREAPPROVAL",
+    "APPROVAL", "PHASE_4", "WITHDRAWAL",
+}
+PHASES = {f"PHASE_{n}": str(n) for n in range(1, 5)}
 
 
-# =============================================================================
-# Helper functions
-# =============================================================================
-
-def now_utc() -> str:
+def now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def print_section(title: str) -> None:
-    print("\n" + "=" * 100)
-    print(title)
-    print("=" * 100)
+def section(s):
+    print("\n" + "=" * 90 + "\n" + s + "\n" + "=" * 90, flush=True)
 
 
-def clean_cell(x: Any) -> str:
-    """
-    Clean scalar values, lists, numpy arrays, and pandas/pyarrow-like arrays.
-
-    Open Targets clinicalReportIds can appear as an array. This converts it
-    into a clean semicolon-separated string.
-    """
-    if x is None:
-        return ""
-
-    try:
-        if pd.isna(x):
-            return ""
-    except Exception:
-        pass
-
-    if isinstance(x, (list, tuple, set)) or hasattr(x, "tolist"):
-        try:
-            values = x.tolist() if hasattr(x, "tolist") else list(x)
-            cleaned = [clean_cell(v) for v in values]
-            cleaned = [v for v in cleaned if v]
-            return ";".join(sorted(set(cleaned)))
-        except Exception:
-            pass
-
-    if isinstance(x, dict):
-        return json.dumps(x, ensure_ascii=False, sort_keys=True)
-
-    return str(x).strip()
-
-
-def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+def sha256(path):
     h = hashlib.sha256()
-
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(chunk_size), b""):
-            h.update(chunk)
-
+    with Path(path).open("rb") as stream:
+        for b in iter(lambda: stream.read(4 * 1024 * 1024), b""):
+            h.update(b)
     return h.hexdigest()
 
 
-def human_size(num_bytes: int) -> str:
-    size = float(num_bytes)
-
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if size < 1024:
-            return f"{size:.2f} {unit}"
-        size /= 1024
-
-    return f"{size:.2f} PB"
+def value(x):
+    return "" if x is None else str(x).strip()
 
 
-def safe_phase_to_int(x: Any) -> int:
-    """
-    Convert Open Targets maxClinicalStage into integer max_phase.
-
-    Examples:
-        APPROVAL -> 4
-        Phase 3  -> 3
-        2        -> 2
-        Unknown  -> 0
-    """
-    s = clean_cell(x)
-
-    if not s:
-        return 0
-
-    low = s.lower()
-
-    if low in {"approval", "approved", "launched", "marketed"}:
-        return 4
-
-    nums = re.findall(r"\d+(?:\.\d+)?", low)
-
-    if nums:
-        try:
-            return int(float(nums[-1]))
-        except Exception:
-            return 0
-
-    return 0
+def list_items(x):
+    if x is None:
+        return []
+    if hasattr(x, "tolist"):
+        x = x.tolist()
+    if isinstance(x, (list, tuple)):
+        return [value(v) for v in x if value(v)]
+    if value(x):
+        return [value(x)]
+    return []
 
 
-def infer_drug_identifier_type(drug_id: str) -> str:
-    """
-    Open Targets drug IDs are commonly ChEMBL IDs for small molecules/drugs.
-    """
-    x = clean_cell(drug_id)
-
-    if not x:
-        return ""
-
-    if x.upper().startswith("CHEMBL"):
-        return "ChEMBL"
-
-    return "OpenTargets_DrugID"
-
-
-def infer_disease_identifier_type(disease_id: str) -> str:
-    """
-    Open Targets disease IDs are usually EFO, MONDO, HP, Orphanet, etc.
-    """
-    x = clean_cell(disease_id)
-
-    if not x:
-        return ""
-
-    upper = x.upper()
-
-    if upper.startswith("EFO_") or upper.startswith("EFO:"):
-        return "EFO"
-
-    if upper.startswith("MONDO_") or upper.startswith("MONDO:"):
-        return "MONDO"
-
-    if upper.startswith("HP_") or upper.startswith("HP:"):
-        return "HPO"
-
-    if upper.startswith("ORPHANET_") or upper.startswith("ORPHANET:"):
-        return "Orphanet"
-
-    if upper.startswith("DOID_") or upper.startswith("DOID:"):
-        return "DOID"
-
-    return "OpenTargets_DiseaseID"
+def normalize_stage(raw):
+    """Do not conflate marketing authorisation with Phase IV trials."""
+    original = value(raw)
+    key = re.sub(r"[\s/-]+", "_", original.upper()).strip("_")
+    variants = {"APPROVED": "APPROVAL", "LAUNCHED": "APPROVAL",
+                "PHASE_IV": "PHASE_4", "PHASE_III": "PHASE_3",
+                "PHASE_II": "PHASE_2", "PHASE_I": "PHASE_1",
+                "EARLY_PHASE_I": "EARLY_PHASE_1", "PHASE_I_II": "PHASE_1_2",
+                "PHASE_II_III": "PHASE_2_3", "PRE_APPROVAL": "PREAPPROVAL"}
+    key = variants.get(key, key)
+    if not original:
+        return "", "missing", "", "False"
+    if key not in STAGES:
+        return original, "unrecognised", "", "False"
+    return key, "recognised", PHASES.get(key, ""), str(key == "APPROVAL")
 
 
-def fetch_text(url: str, timeout: int = 90) -> str:
-    r = requests.get(url, headers={"User-Agent": UA}, timeout=timeout)
-    r.raise_for_status()
-    return r.text
+def identifier(x, entity):
+    """Syntax-only validation; canonical syntax does not imply ontology mapping."""
+    original = value(x)
+    token = original.upper().replace("_", ":")
+    if not original:
+        return ("", "", "", "missing")
+    if entity == "drug":
+        if re.fullmatch(r"CHEMBL\d+", token):
+            return (original, "ChEMBL", f"CHEMBL:{token}", "syntax_valid")
+        return (original, "unresolved", "", "unrecognised_namespace")
+    for pattern, prefix, label, padding in (
+        (r"EFO:(\d+)", "EFO", "EFO", 7),
+        (r"MONDO:(\d+)", "MONDO", "MONDO", 7),
+        (r"HP:(\d+)", "HP", "HPO", 7),
+        (r"DOID:(\d+)", "DOID", "DOID", 0),
+        (r"(?:ORPHA|ORPHANET):(\d+)", "ORPHA", "Orphanet", 0),
+        (r"OMIM:(\d+)", "OMIM", "OMIM", 0),
+        (r"MESH:([CD]\d{6,9})", "MESH", "MeSH", 0),
+    ):
+        m = re.fullmatch(pattern, token)
+        if m:
+            suffix = m.group(1).zfill(padding) if padding else m.group(1)
+            return (original, label, f"{prefix}:{suffix}", "syntax_valid")
+    return (original, "unresolved", "", "unrecognised_namespace")
 
 
-def list_parquet_files(dir_url: str) -> List[str]:
-    html = fetch_text(dir_url)
-    files = re.findall(r'href="([^"]+\.parquet)"', html)
-    files = sorted(set(files))
-    return [dir_url.rstrip("/") + "/" + f for f in files]
+def source_listing(release, dataset):
+    """Discover official Parquet partition names, not source data values."""
+    base = f"{BASE}/{release}/output/{dataset}/"
+    response = requests.get(
+        base,
+        timeout=(25, 120),
+        headers={"User-Agent": "OT-Research-Exporter/3.0"},
+    )
+    response.raise_for_status()
+    hrefs = re.findall(r'href=["\']([^"\']+\.parquet)["\']', response.text, re.I)
+    result = {}
+    for href in hrefs:
+        full = urljoin(base, href)
+        parsed = urlparse(full)
+        if (
+            parsed.netloc != "ftp.ebi.ac.uk"
+            or parsed.path.rsplit("/", 1)[0]
+            != urlparse(base).path.rstrip("/")
+        ):
+            continue
+        filename = Path(parsed.path).name
+        if filename in result and result[filename] != full:
+            raise ValueError("Duplicate partition filename with different URLs")
+        result[filename] = full
+    if not result:
+        raise RuntimeError(
+            f"No parquet partitions found in official directory: {base}"
+        )
+    return result
 
 
-def download(url: str, out_path: Path, timeout: int = 600) -> Path:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    if out_path.exists() and out_path.stat().st_size > 0:
-        print(f"  [CACHED] {out_path}")
-        print(f"           Size:   {human_size(out_path.stat().st_size)}")
-        print(f"           SHA256: {sha256_file(out_path)}")
-        return out_path
-
-    print(f"  [DOWNLOAD] {url}")
-
-    tmp = out_path.with_suffix(out_path.suffix + ".part")
-
-    with requests.get(url, headers={"User-Agent": UA}, stream=True, timeout=timeout) as r:
-        r.raise_for_status()
-
-        with open(tmp, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    f.write(chunk)
-
-    tmp.replace(out_path)
-
-    print(f"           Size:   {human_size(out_path.stat().st_size)}")
-    print(f"           SHA256: {sha256_file(out_path)}")
-
-    return out_path
+def obtain(url, dest):
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(dest.name + ".download")
+    try:
+        with requests.get(url, stream=True, timeout=(30, 1800)) as r:
+            r.raise_for_status()
+            with tmp.open("wb") as f:
+                for piece in r.iter_content(4 * 1024 * 1024):
+                    if piece:
+                        f.write(piece)
+        if not tmp.is_file() or not tmp.stat().st_size:
+            raise RuntimeError(f"Empty downloaded parquet: {url}")
+        pq.ParquetFile(tmp)
+        tmp.replace(dest)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
-def download_dataset(
-    release: str,
-    dataset: str,
-    workdir: Path,
-) -> Tuple[str, List[Path]]:
-    print_section(f"Downloading Open Targets dataset: {dataset}")
+def choose_files(workdir, release, dataset, offline, download_missing):
+    directory = workdir / release / dataset
+    local = sorted(
+        p for p in directory.glob("*.parquet") if p.is_file()
+    )
 
-    dir_url = f"{BASE}/{release}/output/{dataset}/"
-    print(f"[URL] {dir_url}")
+    if offline:
+        if not local:
+            raise FileNotFoundError(
+                f"No offline parquet for {dataset} in {directory}"
+            )
+        print(
+            f"[OFFLINE/NOT INVENTORY VERIFIED] "
+            f"{dataset}: {len(local)} local files"
+        )
+        return local, False, []
 
-    parquet_urls = list_parquet_files(dir_url)
+    listing = source_listing(release, dataset)
+    expected = set(listing)
+    existing = {p.name for p in local}
+    extras = sorted(existing - expected)
 
-    if not parquet_urls:
-        raise RuntimeError(f"No parquet files found at: {dir_url}")
+    if extras:
+        raise RuntimeError(
+            f"Unexpected {dataset} parquet files: {extras[:15]}"
+        )
 
-    print(f"[PARQUET FILES] {len(parquet_urls):,}")
+    missing = sorted(expected - existing)
 
-    local_paths = []
+    if missing and not download_missing:
+        raise FileNotFoundError(
+            f"{dataset}: {len(missing)} missing partitions: {missing[:15]}. "
+            "Pass --download-missing to fetch them, or --offline to inspect "
+            "existing files (not lockable)."
+        )
 
-    for url in parquet_urls:
-        fname = url.split("/")[-1]
-        local_path = workdir / release / dataset / fname
-        local_paths.append(download(url, local_path))
+    for name in missing:
+        print(f"[DOWNLOAD MISSING] {dataset}/{name}")
+        obtain(listing[name], directory / name)
 
-    return dir_url, local_paths
+    found = sorted(directory / name for name in expected)
+
+    for p in found:
+        if p.stat().st_size == 0:
+            raise RuntimeError(f"Empty parquet {p}")
+        pq.ParquetFile(p)
+
+    print(
+        f"[VERIFIED INVENTORY] {dataset}: "
+        f"{len(found)} official parquet files, missing=0"
+    )
+    return found, True, sorted(expected)
 
 
-def read_parquets(paths: List[Path], dataset: str) -> pd.DataFrame:
-    print_section(f"Reading dataset: {dataset}")
+def inspect_source(dataset, paths):
+    info = []
+    required = (
+        {"id", "name"}
+        if dataset != "clinical_indication"
+        else {
+            "id", "drugId", "diseaseId",
+            "maxClinicalStage", "clinicalReportIds",
+        }
+    )
 
-    dfs = []
+    total = 0
 
     for path in paths:
-        print(f"[READ] {path}")
-        table = pq.read_table(path)
-        df = table.to_pandas()
+        p = pq.ParquetFile(path)
+        columns = p.schema_arrow.names
+        missing = required - set(columns)
 
-        print(f"  rows={len(df):,}, cols={len(df.columns):,}")
+        if missing:
+            raise RuntimeError(
+                f"{path.name}: {dataset} missing source columns "
+                f"{sorted(missing)}"
+            )
 
-        dfs.append(df)
+        n = p.metadata.num_rows
+        total += n
 
-    if not dfs:
-        raise RuntimeError(f"No dataframes read for dataset: {dataset}")
+        info.append({
+            "file": str(path),
+            "rows": n,
+            "columns": columns,
+            "bytes": path.stat().st_size,
+            "sha256": sha256(path),
+        })
 
-    out = pd.concat(dfs, ignore_index=True)
+        print(
+            f"  {path.name}: rows={n:,}; "
+            f"fields={len(columns)}; bytes={path.stat().st_size:,}"
+        )
+        print("    HEADER: " + " | ".join(columns))
 
-    print(f"[COMBINED] {dataset}: rows={len(out):,}, cols={len(out.columns):,}")
-    print("[COLUMNS]")
+    print(
+        f"[{dataset}] {len(paths)} partitions; "
+        f"{total:,} records"
+    )
 
-    for col in out.columns:
-        print(f"  - {col}")
-
-    return out
-
-
-# =============================================================================
-# Mapping functions
-# =============================================================================
-
-def build_drug_name_map(drug_df: pd.DataFrame) -> Dict[str, str]:
-    """
-    drug_molecule expected schema includes:
-        id, name
-    """
-    required = {"id", "name"}
-    missing = required - set(drug_df.columns)
-
-    if missing:
-        raise RuntimeError(f"drug_molecule is missing required columns: {missing}")
-
-    mapping = {}
-
-    for _, row in drug_df[["id", "name"]].iterrows():
-        drug_id = clean_cell(row["id"])
-        drug_name = clean_cell(row["name"])
-
-        if drug_id and drug_name:
-            mapping[drug_id] = drug_name
-
-    print(f"[DRUG NAME MAP] {len(mapping):,} entries")
-
-    return mapping
+    return info, total
 
 
-def build_disease_name_map(disease_df: pd.DataFrame) -> Dict[str, str]:
-    """
-    disease expected schema includes:
-        id, name
-    """
-    required = {"id", "name"}
-    missing = required - set(disease_df.columns)
+def name_lookup(paths, kind):
+    """Map unique names only; use identifier placeholder if conflicting."""
+    names = defaultdict(set)
 
-    if missing:
-        raise RuntimeError(f"disease is missing required columns: {missing}")
+    for path in paths:
+        reader = pq.ParquetFile(path)
 
-    mapping = {}
+        for batch in reader.iter_batches(
+            batch_size=40000,
+            columns=["id", "name"],
+        ):
+            for row in batch.to_pylist():
+                id_ = value(row["id"])
+                name = value(row["name"])
+                if id_ and name:
+                    names[id_].add(name)
 
-    for _, row in disease_df[["id", "name"]].iterrows():
-        disease_id = clean_cell(row["id"])
-        disease_name = clean_cell(row["name"])
+    mapping = {
+        k: next(iter(v))
+        for k, v in names.items()
+        if len(v) == 1
+    }
 
-        if disease_id and disease_name:
-            mapping[disease_id] = disease_name
+    conflicts = {
+        k: sorted(v)
+        for k, v in names.items()
+        if len(v) > 1
+    }
 
-    print(f"[DISEASE NAME MAP] {len(mapping):,} entries")
+    print(
+        f"[{kind} LOOKUP] "
+        f"unambiguous={len(mapping):,}, "
+        f"conflicting IDs={len(conflicts):,}"
+    )
 
-    return mapping
+    return mapping, conflicts
 
 
-def load_optional_chembl_mapping(chembl_csv: Optional[Path]) -> Dict[str, str]:
-    """
-    Optional fallback only. Open Targets drug_molecule already provides names.
-    """
-    if chembl_csv is None:
-        return {}
+def optional_chembl_lookup(path):
+    if not path:
+        return {}, {}
 
-    if not chembl_csv.exists():
-        print(f"[WARNING] ChEMBL mapping file not found, skipping: {chembl_csv}")
-        return {}
+    names = defaultdict(set)
 
-    print_section("Loading optional ChEMBL mapping")
-    print(f"[ChEMBL CSV] {chembl_csv}")
+    with Path(path).open(
+        encoding="utf-8-sig",
+        newline="",
+    ) as f:
+        reader = csv.DictReader(f)
 
-    df = pd.read_csv(chembl_csv, dtype=str, low_memory=False).fillna("")
+        idcol = (
+            "drug_id"
+            if "drug_id" in reader.fieldnames
+            else "drug_identifier"
+        )
 
-    # Support both old and unified ChEMBL outputs.
-    if "drug_id" in df.columns and "drug_name" in df.columns:
-        id_col = "drug_id"
-    elif "drug_identifier" in df.columns and "drug_name" in df.columns:
-        id_col = "drug_identifier"
+        if (
+            idcol not in reader.fieldnames
+            or "drug_name" not in reader.fieldnames
+        ):
+            raise RuntimeError(
+                "ChEMBL fallback CSV needs "
+                "drug_id/drug_identifier and drug_name"
+            )
+
+        for row in reader:
+            drug_id = value(row[idcol])
+            name = value(row["drug_name"])
+
+            if drug_id and name and name != drug_id:
+                names[drug_id].add(name)
+
+    clean = {
+        k: next(iter(v))
+        for k, v in names.items()
+        if len(v) == 1
+    }
+
+    conflicts = {
+        k: sorted(v)
+        for k, v in names.items()
+        if len(v) > 1
+    }
+
+    print(
+        f"[OPTIONAL ChEMBL MAP] "
+        f"unambiguous={len(clean):,} "
+        f"conflicts={len(conflicts):,}"
+    )
+
+    return clean, conflicts
+
+
+def form_record(
+    raw,
+    drug_names,
+    disease_names,
+    drug_conflicts,
+    disease_conflicts,
+    chembl_names,
+    chembl_conflicts,
+    release,
+    partition,
+    row_index,
+):
+    drug = value(raw.get("drugId"))
+    disease = value(raw.get("diseaseId"))
+    indication = value(raw.get("id"))
+
+    errors = []
+
+    if not drug:
+        errors.append("missing_drug_id")
+
+    if not disease:
+        errors.append("missing_disease_id")
+
+    if errors:
+        return None, {
+            "source_parquet": partition,
+            "source_row_number": row_index,
+            "indication_id": indication,
+            "drug_id": drug,
+            "disease_id": disease,
+            "rejection_reason": "|".join(errors),
+        }
+
+    dorig, dns, dcanonical, dvalid = identifier(drug, "drug")
+    sorig, sns, scanonical, svalid = identifier(disease, "disease")
+
+    if drug in drug_conflicts:
+        drug_name, drug_lookup = (
+            drug,
+            "conflicting_names_identifier_placeholder",
+        )
+    elif drug in drug_names:
+        drug_name, drug_lookup = drug_names[drug], "drug_molecule"
+    elif drug in chembl_conflicts:
+        drug_name, drug_lookup = (
+            drug,
+            "conflicting_chembl_names_identifier_placeholder",
+        )
+    elif drug in chembl_names:
+        drug_name, drug_lookup = (
+            chembl_names[drug],
+            "optional_chembl_csv",
+        )
     else:
-        print("[WARNING] ChEMBL CSV must contain drug_id/drug_identifier and drug_name. Skipping.")
-        return {}
-
-    mapping = {}
-
-    for _, row in df.iterrows():
-        drug_id = clean_cell(row[id_col])
-        drug_name = clean_cell(row["drug_name"])
-
-        if not drug_id or not drug_name:
-            continue
-
-        mapping[drug_id] = drug_name
-
-        if not drug_id.startswith("CHEMBL"):
-            mapping[f"CHEMBL{drug_id}"] = drug_name
-
-    print(f"[OPTIONAL ChEMBL MAP] {len(mapping):,} entries")
-
-    return mapping
-
-
-# =============================================================================
-# Main extraction
-# =============================================================================
-
-def extract_opentargets_drug_disease(
-    clinical_df: pd.DataFrame,
-    drug_name_map: Dict[str, str],
-    disease_name_map: Dict[str, str],
-    chembl_name_map: Dict[str, str],
-    release: str,
-) -> pd.DataFrame:
-    """
-    clinical_indication expected schema:
-        id
-        maxClinicalStage
-        clinicalReportIds
-        diseaseId
-        drugId
-    """
-    print_section("Extracting Open Targets drug-disease mappings")
-
-    required = {
-        "id",
-        "maxClinicalStage",
-        "clinicalReportIds",
-        "diseaseId",
-        "drugId",
-    }
-
-    missing = required - set(clinical_df.columns)
-
-    if missing:
-        raise RuntimeError(
-            f"clinical_indication is missing expected columns: {missing}\n"
-            f"Available columns: {list(clinical_df.columns)}"
+        drug_name, drug_lookup = (
+            drug,
+            "unmatched_identifier_placeholder",
         )
 
-    out = pd.DataFrame()
-
-    out["opentargets_indication_id"] = clinical_df["id"].map(clean_cell)
-    out["drug_id"] = clinical_df["drugId"].map(clean_cell)
-    out["disease_id"] = clinical_df["diseaseId"].map(clean_cell)
-    out["clinical_phase_raw"] = clinical_df["maxClinicalStage"].map(clean_cell)
-    out["max_phase"] = clinical_df["maxClinicalStage"].map(safe_phase_to_int).astype(int)
-    out["clinical_report_ids"] = clinical_df["clinicalReportIds"].map(clean_cell)
-
-    out["drug_name"] = out["drug_id"].map(
-        lambda x: drug_name_map.get(x, chembl_name_map.get(x, x))
-    )
-
-    out["disease_name"] = out["disease_id"].map(
-        lambda x: disease_name_map.get(x, x)
-    )
-
-    # -------------------------------------------------------------------------
-    # Unified schema columns
-    # -------------------------------------------------------------------------
-    out["drug_identifier"] = out["drug_id"]
-    out["drug_identifier_type"] = out["drug_id"].map(infer_drug_identifier_type)
-
-    out["disease_or_condition_name"] = out["disease_name"]
-    out["disease_or_condition_identifier"] = out["disease_id"]
-    out["disease_or_condition_identifier_type"] = out["disease_id"].map(
-        infer_disease_identifier_type
-    )
-
-    out["relationship_type"] = "clinical_indication"
-    out["evidence_type"] = "opentargets_clinical_indication"
-
-    out["source"] = "OpenTargets"
-    out["internal_source"] = f"Open Targets Platform {release} clinical_indication"
-
-    out["dataset"] = "clinical_indication"
-    out["release"] = release
-
-    # Clean strings
-    for col in out.columns:
-        if col != "max_phase":
-            out[col] = out[col].map(clean_cell)
-
-    before = len(out)
-
-    out = out[
-        (out["drug_identifier"] != "")
-        & (out["disease_or_condition_identifier"] != "")
-        & (out["disease_or_condition_name"] != "")
-    ].copy()
-
-    removed_empty = before - len(out)
-
-    before_dup = len(out)
-
-    out = out.drop_duplicates(
-        subset=[
-            "drug_identifier",
-            "disease_or_condition_identifier",
-            "max_phase",
-            "clinical_phase_raw",
-            "opentargets_indication_id",
-        ]
-    ).reset_index(drop=True)
-
-    removed_duplicates = before_dup - len(out)
-
-    out = out[OUTPUT_COLUMNS]
-
-    print(f"[INPUT ROWS] {len(clinical_df):,}")
-    print(f"[OUTPUT ROWS] {len(out):,}")
-    print(f"[REMOVED EMPTY DRUG/DISEASE] {removed_empty:,}")
-    print(f"[REMOVED DUPLICATES] {removed_duplicates:,}")
-
-    print("\n[OUTPUT PREVIEW]")
-    preview_cols = [
-        "drug_name",
-        "drug_identifier",
-        "disease_or_condition_name",
-        "disease_or_condition_identifier",
-        "relationship_type",
-        "evidence_type",
-        "max_phase",
-        "clinical_phase_raw",
-        "release",
-    ]
-
-    print(out[preview_cols].head(20).to_string(index=False))
-
-    return out
-
-
-def summarise_output(df: pd.DataFrame) -> Dict[str, Any]:
-    print_section("Output summary")
-
-    summary = {
-        "rows": int(len(df)),
-        "columns": list(df.columns),
-        "unique_drug_identifiers": int(df["drug_identifier"].nunique()),
-        "unique_drug_names": int(df["drug_name"].nunique()),
-        "unique_disease_identifiers": int(
-            df["disease_or_condition_identifier"].nunique()
-        ),
-        "unique_disease_names": int(
-            df["disease_or_condition_name"].nunique()
-        ),
-        "unique_drug_disease_pairs": int(
-            df[
-                [
-                    "drug_identifier",
-                    "disease_or_condition_identifier",
-                ]
-            ]
-            .drop_duplicates()
-            .shape[0]
-        ),
-        "relationship_type_counts": (
-            df["relationship_type"].value_counts().to_dict()
-            if len(df)
-            else {}
-        ),
-        "evidence_type_counts": (
-            df["evidence_type"].value_counts().to_dict()
-            if len(df)
-            else {}
-        ),
-        "max_phase_counts": (
-            df["max_phase"]
-            .value_counts()
-            .sort_index()
-            .reset_index()
-            .rename(columns={"index": "max_phase", "max_phase": "n"})
-            .to_dict(orient="records")
-        ),
-        "clinical_phase_raw_counts": (
-            df["clinical_phase_raw"]
-            .value_counts()
-            .reset_index()
-            .rename(columns={"index": "clinical_phase_raw", "clinical_phase_raw": "n"})
-            .to_dict(orient="records")
-        ),
-        "head": df.head(20).to_dict(orient="records"),
-    }
-
-    for key, value in summary.items():
-        if key not in {
-            "head",
-            "max_phase_counts",
-            "clinical_phase_raw_counts",
-            "columns",
-        }:
-            print(f"{key}: {value}")
-
-    print("\n[MAX PHASE COUNTS]")
-    print(df["max_phase"].value_counts().sort_index().to_string())
-
-    print("\n[CLINICAL PHASE RAW COUNTS]")
-    print(df["clinical_phase_raw"].value_counts().head(50).to_string())
-
-    return summary
-
-
-def write_csv(df: pd.DataFrame, out_csv: Path) -> None:
-    print_section("Writing CSV")
-
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(out_csv, index=False, quoting=csv.QUOTE_ALL)
-
-    print(f"[OUTPUT] {out_csv}")
-    print(f"[ROWS] {len(df):,}")
-    print(f"[SIZE] {human_size(out_csv.stat().st_size)}")
-    print(f"[SHA256] {sha256_file(out_csv)}")
-
-
-# =============================================================================
-# Main
-# =============================================================================
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Generate Open Targets drug-disease mapping from clinical_indication "
-            "using the unified multi-source schema."
+    if disease in disease_conflicts:
+        disease_name, disease_lookup = (
+            disease,
+            "conflicting_names_identifier_placeholder",
         )
+    elif disease in disease_names:
+        disease_name, disease_lookup = (
+            disease_names[disease],
+            "disease",
+        )
+    else:
+        disease_name, disease_lookup = (
+            disease,
+            "unmatched_identifier_placeholder",
+        )
+
+    original_stage = value(raw.get("maxClinicalStage"))
+
+    stage, stage_validation, phase_number, approval = normalize_stage(
+        original_stage
     )
 
-    parser.add_argument(
-        "--release",
-        default=DEFAULT_RELEASE,
-        help="Open Targets release. Default: 26.03",
-    )
+    refs = list_items(raw.get("clinicalReportIds"))
+    normalized_refs = sorted(set(refs))
 
-    parser.add_argument(
-        "--out",
-        default="./data/processed/opentargets_drug_disease.csv",
-        help="Output CSV path.",
-    )
-
-    parser.add_argument(
-        "--metadata",
-        default="./data/metadata/opentargets_processing_metadata.json",
-        help="Output metadata JSON path.",
-    )
-
-    parser.add_argument(
-        "--workdir",
-        default="./data/raw/opentargets",
-        help="Download/cache directory.",
-    )
-
-    parser.add_argument(
-        "--chembl",
-        default="",
-        help=(
-            "Optional local ChEMBL mapping CSV with drug_id/drug_identifier "
-            "and drug_name columns."
-        ),
-    )
-
-    args = parser.parse_args()
-
-    release = args.release
-    out_csv = Path(args.out).resolve()
-    metadata_path = Path(args.metadata).resolve()
-    workdir = Path(args.workdir).resolve()
-    chembl_path = Path(args.chembl).resolve() if args.chembl else None
-
-    metadata: Dict[str, Any] = {
-        "script": "opentargets.py",
-        "source": "Open Targets Platform",
-        "release": release,
-        "base_url": BASE,
-        "started_at_utc": now_utc(),
-        "status": "started",
-        "datasets": {},
+    out = {
+        "drug_name": drug_name,
+        "drug_identifier": drug,
+        "drug_identifier_type": dns if dns else "unresolved",
+        "disease_or_condition_name": disease_name,
+        "disease_or_condition_identifier": disease,
+        "disease_or_condition_identifier_type": sns if sns else "unresolved",
         "relationship_type": "clinical_indication",
         "evidence_type": "opentargets_clinical_indication",
-        "interpretation": (
-            "Open Targets clinical_indication rows represent drug-disease "
-            "clinical indication relationships with clinical stage metadata. "
-            "maxClinicalStage is converted into max_phase; APPROVAL is treated "
-            "as phase 4. These rows should not all be interpreted as approved "
-            "indications unless filtered by phase/stage."
+        "source": "OpenTargets",
+        "internal_source": (
+            f"Open Targets Platform {release} clinical_indication"
         ),
-        "unified_output_columns": OUTPUT_COLUMNS,
+        "drug_id": drug,
+        "disease_id": disease,
+        "disease_name": disease_name,
+        "max_clinical_stage_for_indication": stage,
+        "clinical_phase_raw": original_stage,
+        "clinical_stage_validation": stage_validation,
+        "clinical_phase_numeric": phase_number,
+        "clinical_stage_is_explicit_approval": approval,
+        "clinical_report_ids": ";".join(normalized_refs),
+        "clinical_report_ids_original": json.dumps(
+            refs,
+            ensure_ascii=False,
+        ),
+        "clinical_report_count": len(normalized_refs),
+        "opentargets_indication_id": indication,
+        "drug_name_lookup_status": drug_lookup,
+        "disease_name_lookup_status": disease_lookup,
+        "dataset": "clinical_indication",
+        "release": release,
+        "opentargets_source_parquet": partition,
+        "opentargets_source_row_number": row_index,
+        "evidence_granularity": "aggregated_clinical_indication",
+        "drug_identifier_original": dorig,
+        "drug_identifier_namespace": dns,
+        "drug_identifier_canonical": dcanonical,
+        "drug_identifier_validation": dvalid,
+        "disease_identifier_original": sorig,
+        "disease_identifier_namespace": sns,
+        "disease_identifier_canonical": scanonical,
+        "disease_identifier_validation": svalid,
+    }
+
+    return out, None
+
+
+def run(args):
+    release = args.release
+
+    if release != RELEASE:
+        raise ValueError(
+            f"This script pins release {RELEASE}; got {release!r}"
+        )
+
+    workdir = args.workdir.resolve()
+    outfile = args.out.resolve()
+    metapath = args.metadata.resolve()
+
+    outfile.parent.mkdir(parents=True, exist_ok=True)
+    metapath.parent.mkdir(parents=True, exist_ok=True)
+
+    tmp = outfile.with_name(
+        outfile.name + ".processing.tmp"
+    )
+
+    rejected_path = outfile.with_name(
+        "opentargets_rejected_rows.csv"
+    )
+
+    reject_tmp = rejected_path.with_name(
+        rejected_path.name + ".processing.tmp"
+    )
+
+    report = {
+        "source": "OpenTargets",
+        "release": release,
+        "started_at_utc": now(),
+        "status": "started",
+        "complete_partition_inventory_verified": False,
+        "interpretation": (
+            "Aggregate drug-disease clinical indication; reports "
+            "not independent of constituent sources"
+        ),
+        "core_columns": CORE,
+        "output_columns": COLUMNS,
     }
 
     try:
-        print_section("Open Targets -> unified drug-disease mapping CSV")
-        print(f"[RELEASE] {release}")
-        print(f"[OUTPUT] {out_csv}")
-        print(f"[METADATA] {metadata_path}")
-        print(f"[WORKDIR] {workdir}")
+        section("1. ORIGINAL RELEASE FILE INVENTORY")
 
-        # Download datasets
-        clinical_url, clinical_paths = download_dataset(
-            release=release,
-            dataset="clinical_indication",
-            workdir=workdir,
+        all_paths = {}
+        inventories = {}
+        input_counts = {}
+        verified = True
+
+        for dataset in DATASETS:
+            paths, flag, names = choose_files(
+                workdir,
+                release,
+                dataset,
+                args.offline,
+                args.download_missing,
+            )
+
+            all_paths[dataset] = paths
+
+            info, count = inspect_source(dataset, paths)
+
+            inventories[dataset] = {
+                "partition_listing_verified": flag,
+                "official_parquet_filenames": names,
+                "files": info,
+            }
+
+            input_counts[dataset] = count
+            verified &= flag
+
+        report["datasets"] = inventories
+        report["input_rows"] = input_counts
+        report["complete_partition_inventory_verified"] = verified
+
+        section("2. EXACT SOURCE LOOKUPS / NAMING")
+
+        drug_names, drug_conflicts = name_lookup(
+            all_paths["drug_molecule"], "drug"
         )
 
-        drug_url, drug_paths = download_dataset(
-            release=release,
-            dataset="drug_molecule",
-            workdir=workdir,
+        disease_names, disease_conflicts = name_lookup(
+            all_paths["disease"], "disease"
         )
 
-        disease_url, disease_paths = download_dataset(
-            release=release,
-            dataset="disease",
-            workdir=workdir,
+        chembl_names, chembl_conflicts = optional_chembl_lookup(
+            args.chembl
         )
 
-        metadata["datasets"]["clinical_indication"] = {
-            "url": clinical_url,
-            "files": [str(p) for p in clinical_paths],
+        report["name_lookup"] = {
+            "drug_unambiguous": len(drug_names),
+            "disease_unambiguous": len(disease_names),
+            "drug_conflicts": len(drug_conflicts),
+            "disease_conflicts": len(disease_conflicts),
+            "drug_conflict_examples": dict(
+                list(drug_conflicts.items())[:15]
+            ),
+            "disease_conflict_examples": dict(
+                list(disease_conflicts.items())[:15]
+            ),
+            "optional_chembl_unambiguous": len(chembl_names),
+            "optional_chembl_conflicts": len(chembl_conflicts),
         }
 
-        metadata["datasets"]["drug_molecule"] = {
-            "url": drug_url,
-            "files": [str(p) for p in drug_paths],
-        }
-
-        metadata["datasets"]["disease"] = {
-            "url": disease_url,
-            "files": [str(p) for p in disease_paths],
-        }
-
-        # Read datasets
-        clinical_df = read_parquets(clinical_paths, "clinical_indication")
-        drug_df = read_parquets(drug_paths, "drug_molecule")
-        disease_df = read_parquets(disease_paths, "disease")
-
-        metadata["datasets"]["clinical_indication"]["rows"] = int(len(clinical_df))
-        metadata["datasets"]["clinical_indication"]["columns"] = list(clinical_df.columns)
-
-        metadata["datasets"]["drug_molecule"]["rows"] = int(len(drug_df))
-        metadata["datasets"]["drug_molecule"]["columns"] = list(drug_df.columns)
-
-        metadata["datasets"]["disease"]["rows"] = int(len(disease_df))
-        metadata["datasets"]["disease"]["columns"] = list(disease_df.columns)
-
-        # Build maps
-        drug_name_map = build_drug_name_map(drug_df)
-        disease_name_map = build_disease_name_map(disease_df)
-        chembl_name_map = load_optional_chembl_mapping(chembl_path)
-
-        metadata["name_mapping"] = {
-            "drug_molecule_entries": len(drug_name_map),
-            "disease_entries": len(disease_name_map),
-            "optional_chembl_entries": len(chembl_name_map),
-            "optional_chembl_path": str(chembl_path) if chembl_path else "",
-        }
-
-        # Extract output
-        out_df = extract_opentargets_drug_disease(
-            clinical_df=clinical_df,
-            drug_name_map=drug_name_map,
-            disease_name_map=disease_name_map,
-            chembl_name_map=chembl_name_map,
-            release=release,
+        print(
+            "JOIN: clinical_indication.drugId -> "
+            "drug_molecule.id (unique lookup)"
         )
 
-        if out_df.empty:
-            raise RuntimeError("Final Open Targets output is empty.")
+        print(
+            "JOIN: clinical_indication.diseaseId -> "
+            "disease.id (unique lookup)"
+        )
 
-        write_csv(out_df, out_csv)
+        print(
+            "AMBIGUOUS/MISSING NAMES: use identifier placeholder, "
+            "never arbitrary last name"
+        )
 
-        metadata["output"] = {
-            "path": str(out_csv),
-            "rows": int(len(out_df)),
-            "size_bytes": int(out_csv.stat().st_size),
-            "sha256": sha256_file(out_csv),
-        }
+        print(
+            "REPORT IDs: exact source list JSON plus "
+            "sorted unique list; not independent evidence"
+        )
 
-        metadata["summary"] = summarise_output(out_df)
-        metadata["finished_at_utc"] = now_utc()
-        metadata["status"] = "success"
+        print(
+            "STAGES: APPROVAL separate from PHASE_4 and WITHDRAWAL"
+        )
 
-        print_section("DONE")
-        print("[SUCCESS] Open Targets drug-disease mapping generated.")
-        print(f"[CSV] {out_csv}")
-        print(f"[METADATA] {metadata_path}")
+        section(
+            "3. STREAM INDICATION ROWS AND KEEP REPORT PROVENANCE"
+        )
 
-    except Exception as e:
-        metadata["finished_at_utc"] = now_utc()
-        metadata["status"] = "failed"
-        metadata["error"] = repr(e)
+        counters = Counter()
+        stages = Counter()
+        name_status = Counter()
+        disease_status = Counter()
+        ns_counts = Counter()
+        validation_counts = Counter()
 
-        print_section("FAILED")
-        print(repr(e))
+        pairs = set()
+        indication_ids = Counter()
+        sample = []
+
+        with (
+            tmp.open(
+                "w",
+                encoding="utf-8",
+                newline="",
+            ) as full_f,
+            reject_tmp.open(
+                "w",
+                encoding="utf-8",
+                newline="",
+            ) as rej_f,
+        ):
+            writer = csv.DictWriter(
+                full_f,
+                fieldnames=COLUMNS,
+            )
+            writer.writeheader()
+
+            rejects = csv.DictWriter(
+                rej_f,
+                fieldnames=REJECT_COLUMNS,
+            )
+            rejects.writeheader()
+
+            for path in all_paths["clinical_indication"]:
+                parquet = pq.ParquetFile(path)
+                source_row = 0
+
+                columns = [
+                    "id",
+                    "drugId",
+                    "diseaseId",
+                    "maxClinicalStage",
+                    "clinicalReportIds",
+                ]
+
+                for batch in parquet.iter_batches(
+                    batch_size=args.batch_size,
+                    columns=columns,
+                ):
+                    for raw in batch.to_pylist():
+                        source_row += 1
+                        counters["input_rows"] += 1
+
+                        record, reject = form_record(
+                            raw,
+                            drug_names,
+                            disease_names,
+                            drug_conflicts,
+                            disease_conflicts,
+                            chembl_names,
+                            chembl_conflicts,
+                            release,
+                            path.name,
+                            source_row,
+                        )
+
+                        if reject:
+                            rejects.writerow(reject)
+                            counters["rejected_rows"] += 1
+                            continue
+
+                        writer.writerow(record)
+                        counters["output_rows"] += 1
+
+                        counters[
+                            "clinical_report_links_unique_per_aggregate_sum"
+                        ] += int(record["clinical_report_count"])
+
+                        if record["clinical_report_count"] == 0:
+                            counters[
+                                "indications_without_report_ids"
+                            ] += 1
+
+                        stages[
+                            record["max_clinical_stage_for_indication"]
+                            or "[missing]"
+                        ] += 1
+
+                        name_status[
+                            record["drug_name_lookup_status"]
+                        ] += 1
+
+                        disease_status[
+                            record["disease_name_lookup_status"]
+                        ] += 1
+
+                        ns_counts[
+                            record["disease_identifier_namespace"]
+                        ] += 1
+
+                        validation_counts[
+                            record["disease_identifier_validation"]
+                        ] += 1
+
+                        pairs.add((
+                            record["drug_identifier"],
+                            record["disease_or_condition_identifier"],
+                        ))
+
+                        if record["opentargets_indication_id"]:
+                            indication_ids[
+                                record["opentargets_indication_id"]
+                            ] += 1
+                        else:
+                            counters[
+                                "missing_indication_ids"
+                            ] += 1
+
+                        if len(sample) < max(1, args.head_n):
+                            sample.append(record)
+
+                print(
+                    f"  {path.name}: source rows={source_row:,}"
+                )
+
+                if source_row != parquet.metadata.num_rows:
+                    raise RuntimeError(
+                        f"Parquet row count mismatch in {path}"
+                    )
+
+        if (
+            counters["input_rows"]
+            != input_counts["clinical_indication"]
+        ):
+            raise RuntimeError(
+                "Clinical-indication partition rows do not reconcile"
+            )
+
+        if (
+            counters["input_rows"]
+            != counters["output_rows"] + counters["rejected_rows"]
+        ):
+            raise RuntimeError(
+                "Rejected + retained != input count"
+            )
+
+        if counters["output_rows"] == 0:
+            raise RuntimeError(
+                "No eligible Open Targets records; refusing overwrite"
+            )
+
+        duplicates = sum(
+            n - 1
+            for n in indication_ids.values()
+            if n > 1
+        )
+
+        report.update({
+            "row_counts": dict(counters),
+            "distinct_drug_disease_pairs": len(pairs),
+            "duplicate_nonempty_indication_ids": duplicates,
+            "clinical_stage_counts": dict(stages),
+            "drug_name_lookup_status_counts": dict(name_status),
+            "disease_name_lookup_status_counts": dict(disease_status),
+            "disease_namespace_counts": dict(ns_counts),
+            "disease_validation_counts": dict(validation_counts),
+            "sample_records": sample,
+            "merge_caveat": (
+                "The clinical_indication evidence is derived from "
+                "clinical reports and overlaps with AACT/ChEMBL; "
+                "retain clinical_report_ids and never assume independence."
+            ),
+        })
+
+        section("4. OUTPUT VALIDATION AND COUNTS")
+
+        for k, v in counters.items():
+            print(f"  {k}: {v:,}")
+
+        print(
+            "  distinct drug-disease pairs:",
+            len(pairs),
+        )
+
+        print(
+            "  repeated indication IDs:",
+            duplicates,
+        )
+
+        print("  stages:", dict(stages))
+        print("  drug names:", dict(name_status))
+        print("  disease names:", dict(disease_status))
+        print("  disease namespace:", dict(ns_counts))
+
+        print(
+            "  output columns:",
+            " | ".join(COLUMNS),
+        )
+
+        print(
+            "  first record:",
+            json.dumps(sample[0], indent=2)[:4500],
+        )
+
+        with tmp.open(
+            encoding="utf-8",
+            newline="",
+        ) as f:
+            if next(csv.reader(f)) != COLUMNS:
+                raise RuntimeError("Output schema mismatch")
+
+        # Commit only after all source reads, count reconciliation
+        # and schema checks.
+        tmp.replace(outfile)
+        reject_tmp.replace(rejected_path)
+
+        report["output_file"] = str(outfile)
+        report["rejected_file"] = str(rejected_path)
+        report["output_sha256"] = sha256(outfile)
+        report["rejected_sha256"] = sha256(rejected_path)
+        report["finished_at_utc"] = now()
+
+        report["status"] = (
+            "success"
+            if verified
+            else "offline_unverified_inventory"
+        )
+
+        report_tmp = metapath.with_name(
+            metapath.name + ".processing.tmp"
+        )
+
+        report_tmp.write_text(
+            json.dumps(
+                report,
+                indent=2,
+                ensure_ascii=False,
+                default=str,
+            ) + "\n",
+            encoding="utf-8",
+        )
+
+        report_tmp.replace(metapath)
+
+        print("[OUTPUT OVERWRITTEN]", outfile)
+        print("[AUDIT OVERWRITTEN]", rejected_path)
+        print("[METADATA OVERWRITTEN]", metapath)
+
+        if not verified:
+            print(
+                "[WARNING] --offline used: release partition "
+                "completeness NOT independently verified. "
+                "Do not lock yet."
+            )
+
+    except Exception as exc:
+        failure = metapath.with_name(
+            "opentargets_failed_run.json"
+        )
+
+        report.update({
+            "status": "failed",
+            "error": repr(exc),
+            "finished_at_utc": now(),
+        })
+
+        failure.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        failure.write_text(
+            json.dumps(
+                report,
+                indent=2,
+                default=str,
+            ),
+            encoding="utf-8",
+        )
 
         raise
 
     finally:
-        metadata_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.unlink(missing_ok=True)
+        reject_tmp.unlink(missing_ok=True)
 
-        with open(metadata_path, "w", encoding="utf-8") as f:
-            json.dump(metadata, f, indent=2, default=str)
 
-        print_section("METADATA WRITTEN")
-        print(metadata_path)
+def main():
+    p = argparse.ArgumentParser(
+        description=__doc__,
+    )
+
+    p.add_argument(
+        "--release",
+        default=RELEASE,
+    )
+
+    p.add_argument(
+        "--workdir",
+        type=Path,
+        default=ROOT / "data/raw/opentargets",
+    )
+
+    p.add_argument(
+        "--out",
+        type=Path,
+        default=ROOT / "data/processed/opentargets_drug_disease.csv",
+    )
+
+    p.add_argument(
+        "--metadata",
+        type=Path,
+        default=ROOT / "data/metadata/opentargets_processing_metadata.json",
+    )
+
+    p.add_argument(
+        "--chembl",
+        type=Path,
+        default=None,
+        help="Optional unambiguous drug name fallback from processed ChEMBL",
+    )
+
+    p.add_argument(
+        "--download-missing",
+        action="store_true",
+        help="Download only missing official partitions",
+    )
+
+    p.add_argument(
+        "--offline",
+        action="store_true",
+        help=(
+            "Use cached parquet without online inventory check; "
+            "result NOT lockable until verified"
+        ),
+    )
+
+    p.add_argument(
+        "--batch-size",
+        type=int,
+        default=30000,
+    )
+
+    p.add_argument(
+        "--head-n",
+        type=int,
+        default=3,
+    )
+
+    args = p.parse_args()
+
+    if args.batch_size < 1:
+        p.error("--batch-size must be >=1")
+
+    if args.offline and args.download_missing:
+        p.error(
+            "--offline and --download-missing cannot both be used"
+        )
+
+    run(args)
 
 
 if __name__ == "__main__":

@@ -1,93 +1,37 @@
+
 #!/usr/bin/env python3
+"""CTD chemical-disease source-event processor (merge-compatible).
+
+Default: reuse pinned data/raw/ctd/CTD_chemicals_diseases.tsv.gz and overwrite
+         data/processed/ctd_aggregate_chemical_disease.csv only after success.
+No automatic download, no full-data Pandas load, no source-event deduplication.
+
+The ten common merge columns come first. CTD chemical associations are NOT
+synonymous with clinically approved drug indications. Each source event is
+retained with its line index, evidence class, identifiers, genes and citations.
 """
-CTD -> unified chemical/drug–disease association CSV
-
-Purpose
--------
-Download and process CTD chemical–disease association data into a
-publication-ready, provenance-aware CSV for a multi-source drug–disease
-association dataset.
-
-Recommended main input
-----------------------
-aggregate:
-  CTD_chemicals_diseases.tsv.gz
-
-Optional conservative input
----------------------------
-curated:
-  CTD_curated_chemicals_diseases.tsv.gz
-
-Important interpretation
-------------------------
-CTD records represent chemical–disease associations, not necessarily
-therapeutic drug indications. Some chemicals are drugs, but CTD should be
-kept distinct from curated indication sources such as ChEMBL and from
-clinical-trial co-occurrence sources such as AACT/ClinicalTrials.gov.
-
-Unified output columns
-----------------------
-drug_name
-drug_identifier
-drug_identifier_type
-disease_or_condition_name
-disease_or_condition_identifier
-disease_or_condition_identifier_type
-relationship_type
-evidence_type
-source
-internal_source
-
-CTD-specific metadata columns
------------------------------
-chemical_name
-chemical_id
-cas_rn
-disease_name
-disease_id
-direct_evidence
-inference_gene_symbol
-inference_score
-omim_ids
-pubmed_ids
-
-Notes
------
-- CTD chemical names and identifiers are retained as CTD chemical-level fields.
-- They are also copied into drug-compatible unified fields for harmonisation.
-- This does NOT imply every CTD chemical is an approved drug.
-- Deduplication is limited to exact duplicate rows after metadata retention.
-
-Requirements
-------------
-pip install pandas requests
-"""
-
 from __future__ import annotations
 
 import argparse
 import gzip
 import hashlib
 import json
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
 import pandas as pd
 import requests
 
+ROOT = Path(__file__).resolve().parent
 
-# ============================================================
-# CONFIG
-# ============================================================
-
-CTD_URLS = {
+URLS = {
     "aggregate": "https://ctdbase.org/reports/CTD_chemicals_diseases.tsv.gz",
     "curated": "https://ctdbase.org/reports/CTD_curated_chemicals_diseases.tsv.gz",
 }
 
-
-CTD_OUTPUT_COLUMNS = [
-    # Unified schema columns
+CORE = [
     "drug_name",
     "drug_identifier",
     "drug_identifier_type",
@@ -98,8 +42,9 @@ CTD_OUTPUT_COLUMNS = [
     "evidence_type",
     "source",
     "internal_source",
+]
 
-    # CTD-specific retained metadata
+EXTRA = [
     "chemical_name",
     "chemical_id",
     "cas_rn",
@@ -110,695 +55,1222 @@ CTD_OUTPUT_COLUMNS = [
     "inference_score",
     "omim_ids",
     "pubmed_ids",
+    "ctd_evidence_class",
+    "ctd_has_direct_evidence",
+    "ctd_has_inference_evidence",
+    "ctd_relationship_family",
+    "ctd_source_row_index",
+    "ctd_source_dataset",
 ]
 
+for entity in ("drug", "disease"):
+    EXTRA.extend(
+        f"{entity}_identifier_{suffix}"
+        for suffix in (
+            "original",
+            "namespace",
+            "canonical",
+            "validation",
+        )
+    )
 
-# ============================================================
-# HELPERS
-# ============================================================
+COLUMNS = CORE + EXTRA
 
-def now_utc() -> str:
+SOURCE_FIELDS = [
+    "ChemicalName",
+    "ChemicalID",
+    "CasRN",
+    "DiseaseName",
+    "DiseaseID",
+    "DirectEvidence",
+    "InferenceGeneSymbol",
+    "InferenceScore",
+    "OmimIDs",
+    "PubMedIDs",
+]
+
+REQUIRED = {
+    "ChemicalName",
+    "ChemicalID",
+    "DiseaseName",
+    "DiseaseID",
+}
+
+
+def now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def print_section(title: str) -> None:
-    print("\n" + "=" * 100)
-    print(title)
-    print("=" * 100)
+def heading(title):
+    print(
+        "\n" + "=" * 94
+        + "\n" + title
+        + "\n" + "=" * 94,
+        flush=True,
+    )
 
 
-def human_size(num_bytes: int) -> str:
-    size = float(num_bytes)
-
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if size < 1024:
-            return f"{size:.2f} {unit}"
-        size /= 1024
-
-    return f"{size:.2f} PB"
-
-
-def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+def sha256(path):
     h = hashlib.sha256()
 
     with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(chunk_size), b""):
+        for chunk in iter(
+            lambda: f.read(4 * 1024 * 1024),
+            b"",
+        ):
             h.update(chunk)
 
     return h.hexdigest()
 
 
-def download_file(
-    url: str,
-    out_path: Path,
-    force: bool = False,
-    timeout: int = 1200,
-) -> Path:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+def atomic_json(data, destination):
+    destination.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
-    if out_path.exists() and out_path.stat().st_size > 0 and not force:
-        print(f"[CACHE] Using existing file: {out_path}")
-        print(f"        Size:   {human_size(out_path.stat().st_size)}")
-        print(f"        SHA256: {sha256_file(out_path)}")
-        return out_path
+    tmp = destination.with_name(
+        destination.name + ".tmp"
+    )
 
-    print(f"[DOWNLOAD] {url}")
-
-    tmp = out_path.with_suffix(out_path.suffix + ".part")
-
-    with requests.get(url, stream=True, timeout=timeout) as r:
-        r.raise_for_status()
-
-        with open(tmp, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    f.write(chunk)
-
-    tmp.replace(out_path)
-
-    print(f"[DOWNLOADED] {out_path}")
-    print(f"             Size:   {human_size(out_path.stat().st_size)}")
-    print(f"             SHA256: {sha256_file(out_path)}")
-
-    return out_path
+    try:
+        tmp.write_text(
+            json.dumps(
+                data,
+                indent=2,
+                ensure_ascii=False,
+                default=str,
+            ) + "\n",
+            encoding="utf-8",
+        )
+        tmp.replace(destination)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
-def test_gzip_integrity(path: Path) -> None:
-    """
-    Read through gzip stream to ensure the file is not corrupted.
-    """
-    print_section("GZIP integrity check")
+def download_if_needed(
+    path,
+    url,
+    allow=False,
+    force=False,
+):
+    if (
+        path.is_file()
+        and path.stat().st_size
+        and not force
+    ):
+        print(f"[EXISTING RAW DATA] {path}")
+        return
 
-    total_uncompressed = 0
+    if not allow:
+        raise FileNotFoundError(
+            f"Missing raw CTD file: {path}; "
+            "use --download_missing"
+        )
+
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    tmp = path.with_name(
+        path.name + ".download"
+    )
+
+    try:
+        with requests.get(
+            url,
+            stream=True,
+            timeout=1800,
+        ) as r:
+            r.raise_for_status()
+
+            with tmp.open("wb") as output:
+                for data in r.iter_content(
+                    4 * 1024 * 1024
+                ):
+                    if data:
+                        output.write(data)
+
+        if not tmp.stat().st_size:
+            raise RuntimeError(
+                "Downloaded CTD file is empty"
+            )
+
+        with gzip.open(tmp, "rb") as f:
+            if not f.read(1):
+                raise RuntimeError(
+                    "Downloaded CTD gzip contains no data"
+                )
+
+        tmp.replace(path)
+
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def scan_raw_directory(
+    directory,
+    input_path,
+):
+    heading("1. ORIGINAL DOWNLOADED FILES")
+
+    files = []
+
+    for item in sorted(
+        directory.rglob("*")
+    ):
+        if not item.is_file():
+            continue
+
+        status = (
+            "USED"
+            if item.resolve() == input_path.resolve()
+            else "OTHER"
+        )
+
+        files.append({
+            "path": str(
+                item.relative_to(directory)
+            ),
+            "bytes": item.stat().st_size,
+            "processing_input": status == "USED",
+        })
+
+        print(
+            f"  [{status:5}] "
+            f"{item.relative_to(directory)} | "
+            f"{item.stat().st_size:,} bytes"
+        )
+
+    print(
+        f"Total local files: {len(files)}; "
+        "selected source files: 1"
+    )
+
+    return files
+
+
+def check_gzip(path):
+    heading("2. GZIP INTEGRITY")
+
+    byte_count = 0
 
     with gzip.open(path, "rb") as f:
-        while True:
-            chunk = f.read(1024 * 1024)
+        for b in iter(
+            lambda: f.read(4 * 1024 * 1024),
+            b"",
+        ):
+            byte_count += len(b)
 
-            if not chunk:
-                break
+    print(
+        "GZIP CRC/decompression: PASS; "
+        f"uncompressed bytes: {byte_count:,}"
+    )
 
-            total_uncompressed += len(chunk)
-
-    print("[GZIP CHECK] PASS")
-    print(f"[UNCOMPRESSED BYTES READ] {total_uncompressed:,}")
+    return byte_count
 
 
-def find_header_line_gz(path: Path) -> tuple[int, list[str], list[str]]:
-    """
-    CTD files begin with comment lines. The true header line may also begin
-    with '#'. This function identifies the header by finding required columns.
+def inspect_header(path):
+    heading("3. ORIGINAL CTD TABULAR SCHEMA")
 
-    Returns:
-      header_line_index, raw_comment_preview, header_columns
-    """
-    required = {"ChemicalName", "ChemicalID", "DiseaseName", "DiseaseID"}
-    comment_preview: list[str] = []
+    comments = 0
 
-    with gzip.open(path, "rt", encoding="utf-8", errors="replace") as f:
-        for i, line in enumerate(f):
-            stripped = line.rstrip("\n")
+    with gzip.open(
+        path,
+        "rt",
+        encoding="utf-8-sig",
+        errors="strict",
+        newline="",
+    ) as f:
 
-            if i < 30:
-                comment_preview.append(stripped)
-
-            candidate = stripped.lstrip("#").strip()
-
-            if not candidate:
-                continue
+        for index, line in enumerate(f):
+            candidate = (
+                line.rstrip("\r\n")
+                .lstrip("#")
+                .strip()
+            )
 
             cols = [
-                c.strip().lstrip("#").strip()
-                for c in candidate.split("\t")
+                x.strip()
+                for x in candidate.split("\t")
             ]
 
-            if required.issubset(set(cols)):
-                return i, comment_preview, cols
+            if REQUIRED.issubset(cols):
+
+                if len(cols) != len(set(cols)):
+                    raise RuntimeError(
+                        "Duplicate source column names"
+                    )
+
+                print(
+                    f"Header is file line {index + 1}, "
+                    f"following {comments} preamble lines"
+                )
+
+                print(
+                    f"Columns ({len(cols)}): "
+                    + " | ".join(cols)
+                )
+
+                return index, cols
+
+            comments += 1
 
     raise RuntimeError(
-        "Could not find CTD header line containing required columns."
+        "Could not find CTD header "
+        "in compressed source"
     )
 
 
-def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    df.columns = [
-        str(c).strip().lstrip("#").strip()
-        for c in df.columns
-    ]
-    return df
+def class_of_evidence(
+    direct,
+    gene,
+    score,
+):
+    """Preserve direct and inferred evidence semantics."""
 
-
-def clean_series(s: pd.Series) -> pd.Series:
-    return s.fillna("").astype(str).str.strip()
-
-
-def get_column_or_empty(
-    df: pd.DataFrame,
-    candidates: list[str],
-) -> pd.Series:
-    """
-    Return the first matching column as a clean string Series.
-    Otherwise return empty strings.
-    """
-    for c in candidates:
-        if c in df.columns:
-            return clean_series(df[c])
-
-    return pd.Series([""] * len(df), index=df.index, dtype="string")
-
-
-def infer_ctd_disease_identifier_type(disease_id: str) -> str:
-    """
-    Infer disease identifier type from CTD DiseaseID string.
-
-    Common examples:
-      MESH:D003920
-      OMIM:123456
-    """
-    x = str(disease_id).strip()
-
-    if not x:
-        return ""
-
-    upper = x.upper()
-
-    if upper.startswith("MESH:"):
-        return "MeSH"
-
-    if upper.startswith("OMIM:"):
-        return "OMIM"
-
-    if upper.startswith("DOID:"):
-        return "DOID"
-
-    if upper.startswith("MONDO:"):
-        return "MONDO"
-
-    return "CTD_DiseaseID"
-
-
-def inspect_input_file(
-    path: Path,
-    header_line: int,
-    header_columns: list[str],
-    head_n: int,
-) -> dict:
-    print_section("Inspecting CTD input file")
-
-    print(f"[INPUT] {path}")
-    print(f"[SIZE] {human_size(path.stat().st_size)}")
-    print(f"[SHA256] {sha256_file(path)}")
-    print(f"[HEADER LINE] {header_line}")
-    print(f"[HEADER COLUMNS] {header_columns}")
-
-    head = pd.read_csv(
-        path,
-        sep="\t",
-        compression="gzip",
-        skiprows=header_line,
-        header=0,
-        dtype=str,
-        nrows=head_n,
-        low_memory=False,
-    )
-
-    head = normalize_columns(head)
-
-    print("\n[INPUT HEAD]")
-    print(head.to_string(index=False))
-
-    return {
-        "input_file": str(path),
-        "input_size_bytes": path.stat().st_size,
-        "input_sha256": sha256_file(path),
-        "header_line": header_line,
-        "header_columns": header_columns,
-        "head_preview": head.to_dict(orient="records"),
+    tokens = {
+        x.strip().casefold()
+        for x in direct.split("|")
+        if x.strip()
     }
 
+    if tokens:
+        known = {
+            "therapeutic",
+            "marker/mechanism",
+        }
 
-def transform_ctd_chunk(chunk: pd.DataFrame, subset: str) -> pd.DataFrame:
+        if tokens - known:
+            return "direct_unrecognised"
+
+        if tokens == known:
+            return (
+                "direct_therapeutic_and_"
+                "marker_mechanism"
+            )
+
+        if "therapeutic" in tokens:
+            return "direct_therapeutic"
+
+        return "direct_marker_mechanism"
+
+    if gene:
+        return "inferred_via_gene"
+
+    if score:
+        return "inferred_score_without_gene"
+
+    return "unclassified_association"
+
+
+def disease_identifier_metadata(ids):
     """
-    Transform one CTD input chunk into the unified output schema.
+    Check identifier namespace and syntax.
 
-    Handles both aggregate and curated CTD files. Some fields exist only in
-    the aggregate file, so they are filled with empty values when absent.
+    This does not establish ontology equivalence.
     """
-    chunk = normalize_columns(chunk)
+    upper = (
+        ids.str.upper()
+        .str.replace(
+            "_",
+            ":",
+            n=1,
+            regex=False,
+        )
+    )
 
-    required = [
-        "ChemicalName",
-        "ChemicalID",
-        "DiseaseName",
-        "DiseaseID",
-    ]
+    prefix = (
+        upper.str.extract(
+            r"^([A-Z][A-Z0-9]*):",
+            expand=False,
+        )
+        .fillna("")
+    )
 
-    missing = [c for c in required if c not in chunk.columns]
+    namespace_by_prefix = {
+        "MESH": "MeSH",
+        "OMIM": "OMIM",
+        "DOID": "DOID",
+        "MONDO": "MONDO",
+        "EFO": "EFO",
+        "HP": "HPO",
+        "ORPHA": "Orphanet",
+        "ORPHANET": "Orphanet",
+    }
+
+    namespace = (
+        prefix.map(namespace_by_prefix)
+        .fillna("unresolved")
+    )
+
+    canonical = upper.copy()
+
+    canonical = canonical.str.replace(
+        r"^ORPHANET:",
+        "ORPHA:",
+        regex=True,
+    )
+
+    for p in ("MONDO", "EFO", "HP"):
+
+        mask = canonical.str.fullmatch(
+            p + r":\d{1,7}"
+        )
+
+        if mask.any():
+            values = (
+                canonical.loc[mask]
+                .str.split(":", n=1)
+                .str[-1]
+            )
+
+            canonical.loc[mask] = (
+                p + ":" + values.str.zfill(7)
+            )
+
+    valid = (
+        upper.str.fullmatch(
+            r"MESH:[CD]\d{6,9}"
+        )
+        | upper.str.fullmatch(
+            r"OMIM:\d{6}"
+        )
+        | upper.str.fullmatch(
+            r"DOID:\d+"
+        )
+        | upper.str.fullmatch(
+            r"(?:EFO|MONDO|HP):\d{1,7}"
+        )
+        | upper.str.fullmatch(
+            r"(?:ORPHA|ORPHANET):\d+"
+        )
+    )
+
+    canonical = canonical.where(
+        valid, ""
+    )
+
+    namespace = namespace.where(
+        valid, "unresolved"
+    )
+
+    validation = valid.map({
+        True: "syntax_valid",
+        False: "unresolved_or_invalid",
+    })
+
+    return namespace, canonical, validation
+
+
+def transform(chunk, subset):
+    """
+    Preserve one output record per eligible
+    original CTD source record.
+    """
+    missing = REQUIRED - set(chunk.columns)
 
     if missing:
         raise RuntimeError(
-            f"Missing required CTD columns: {missing}\n"
-            f"Available columns: {list(chunk.columns)}"
+            "CTD source columns missing: "
+            f"{sorted(missing)}"
         )
 
-    chemical_name = get_column_or_empty(chunk, ["ChemicalName"])
-    chemical_id = get_column_or_empty(chunk, ["ChemicalID"])
-    cas_rn = get_column_or_empty(chunk, ["CasRN", "CASRN", "CAS_RN"])
+    for col in SOURCE_FIELDS:
 
-    disease_name = get_column_or_empty(chunk, ["DiseaseName"])
-    disease_id = get_column_or_empty(chunk, ["DiseaseID"])
+        if col not in chunk:
+            chunk[col] = ""
 
-    direct_evidence = get_column_or_empty(chunk, ["DirectEvidence"])
-    inference_gene_symbol = get_column_or_empty(
-        chunk,
-        ["InferenceGeneSymbol", "InferenceGeneSymbols"],
-    )
-    inference_score = get_column_or_empty(chunk, ["InferenceScore"])
-    omim_ids = get_column_or_empty(chunk, ["OmimIDs", "OMIMIDs", "OMIMID"])
-    pubmed_ids = get_column_or_empty(chunk, ["PubMedIDs", "PubMedID"])
+        chunk[col] = (
+            chunk[col]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+        )
 
-    out = pd.DataFrame(
-        {
-            "chemical_name": chemical_name,
-            "chemical_id": chemical_id,
-            "cas_rn": cas_rn,
-            "disease_name": disease_name,
-            "disease_id": disease_id,
-            "direct_evidence": direct_evidence,
-            "inference_gene_symbol": inference_gene_symbol,
-            "inference_score": inference_score,
-            "omim_ids": omim_ids,
-            "pubmed_ids": pubmed_ids,
-        }
+    empty_core = {
+        src: int(chunk[src].eq("").sum())
+        for src in (
+            "ChemicalName",
+            "ChemicalID",
+            "DiseaseName",
+            "DiseaseID",
+        )
+    }
+
+    mask = (
+        chunk["ChemicalName"].ne("")
+        & chunk["ChemicalID"].ne("")
+        & chunk["DiseaseName"].ne("")
+        & chunk["DiseaseID"].ne("")
     )
 
-    # Drop empty essential fields.
-    out = out[
-        (out["chemical_name"].astype(str).str.strip() != "")
-        & (out["chemical_id"].astype(str).str.strip() != "")
-        & (out["disease_name"].astype(str).str.strip() != "")
-        & (out["disease_id"].astype(str).str.strip() != "")
-    ].copy()
+    out = chunk.loc[mask].copy()
 
-    if len(out) == 0:
-        return pd.DataFrame(columns=CTD_OUTPUT_COLUMNS)
+    if out.empty:
+        return (
+            pd.DataFrame(columns=COLUMNS),
+            empty_core,
+            int((~mask).sum()),
+        )
 
-    # ------------------------------------------------------------
-    # Unified schema aliases
-    # ------------------------------------------------------------
-    # Important: CTD is chemical-level. These unified columns are for
-    # harmonisation only and do not imply every chemical is an approved drug.
+    out["ctd_source_row_index"] = (
+        (out.index + 1).astype(str)
+    )
+
+    out["ctd_source_dataset"] = subset
+
+    assignments = {
+        "chemical_name": "ChemicalName",
+        "chemical_id": "ChemicalID",
+        "cas_rn": "CasRN",
+        "disease_name": "DiseaseName",
+        "disease_id": "DiseaseID",
+        "direct_evidence": "DirectEvidence",
+        "inference_gene_symbol":
+            "InferenceGeneSymbol",
+        "inference_score": "InferenceScore",
+        "omim_ids": "OmimIDs",
+        "pubmed_ids": "PubMedIDs",
+    }
+
+    for target, source in assignments.items():
+        out[target] = out[source]
+
     out["drug_name"] = out["chemical_name"]
-    out["drug_identifier"] = out["chemical_id"]
-    out["drug_identifier_type"] = "CTD_ChemicalID"
 
-    out["disease_or_condition_name"] = out["disease_name"]
-    out["disease_or_condition_identifier"] = out["disease_id"]
-    out["disease_or_condition_identifier_type"] = out["disease_id"].apply(
-        infer_ctd_disease_identifier_type
+    out["drug_identifier"] = out["chemical_id"]
+
+    out["disease_or_condition_name"] = (
+        out["disease_name"]
     )
 
-    out["relationship_type"] = "chemical_disease_association"
+    out["disease_or_condition_identifier"] = (
+        out["disease_id"]
+    )
+
+    direct_flag = out["direct_evidence"].ne("")
+
+    inferred_flag = (
+        out["inference_gene_symbol"].ne("")
+        | out["inference_score"].ne("")
+    )
+
+    out["ctd_has_direct_evidence"] = direct_flag
+
+    out["ctd_has_inference_evidence"] = (
+        inferred_flag
+    )
+
+    # Classify each distinct combination once.
+    keys = list(zip(
+        out["direct_evidence"],
+        out["inference_gene_symbol"].ne(""),
+        out["inference_score"].ne(""),
+    ))
+
+    lookup = {
+        key: class_of_evidence(*key)
+        for key in set(keys)
+    }
+
+    out["ctd_evidence_class"] = [
+        lookup[key]
+        for key in keys
+    ]
+
+    # Important:
+    # The current merger deduplicates by nine core
+    # fields, including relationship_type/evidence_type.
+    # These categories prevent direct therapeutic
+    # evidence from being treated as equivalent to
+    # inferred or marker/mechanism evidence.
+    #
+    # The merger will still require modification to
+    # preserve multiple events within one class.
+
+    out["relationship_type"] = (
+        "ctd_" + out["ctd_evidence_class"]
+    )
+
+    out["evidence_type"] = (
+        "ctd_" + out["ctd_evidence_class"]
+    )
+
+    out["ctd_relationship_family"] = (
+        "chemical_disease_association"
+    )
 
     out["source"] = "CTD"
 
     if subset == "aggregate":
-        out["internal_source"] = "CTD_aggregate_chemicals_diseases"
-        out["evidence_type"] = "chemical_disease_association"
-
-    elif subset == "curated":
-        out["internal_source"] = "CTD_curated_chemicals_diseases"
-        out["evidence_type"] = "curated_chemical_disease_association"
-
+        out["internal_source"] = (
+            "CTD_aggregate_chemicals_diseases"
+        )
     else:
-        out["internal_source"] = f"CTD_{subset}"
-        out["evidence_type"] = "chemical_disease_association"
-
-    # Exact duplicate removal only after preserving all useful metadata.
-    out = out.drop_duplicates()
-
-    return out[CTD_OUTPUT_COLUMNS]
-
-
-def process_ctd_file(
-    gz_path: Path,
-    out_csv: Path,
-    subset: str,
-    header_line: int,
-    chunksize: int,
-) -> dict:
-    print_section("Processing CTD file")
-
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
-
-    if out_csv.exists():
-        out_csv.unlink()
-
-    total_input_rows = 0
-    total_output_rows = 0
-    wrote_header = False
-    chunk_index = 0
-
-    missing_counts = {
-        "chemical_name": 0,
-        "chemical_id": 0,
-        "disease_name": 0,
-        "disease_id": 0,
-        "direct_evidence": 0,
-        "inference_gene_symbol": 0,
-        "inference_score": 0,
-        "omim_ids": 0,
-        "pubmed_ids": 0,
-    }
-
-    for chunk in pd.read_csv(
-        gz_path,
-        sep="\t",
-        compression="gzip",
-        skiprows=header_line,
-        header=0,
-        dtype=str,
-        chunksize=chunksize,
-        low_memory=False,
-    ):
-        chunk_index += 1
-        chunk = normalize_columns(chunk)
-        total_input_rows += len(chunk)
-
-        out = transform_ctd_chunk(chunk, subset=subset)
-
-        for col in missing_counts:
-            if col in out.columns:
-                missing_counts[col] += int(
-                    (
-                        out[col]
-                        .fillna("")
-                        .astype(str)
-                        .str.strip()
-                        == ""
-                    ).sum()
-                )
-
-        if len(out) > 0:
-            out.to_csv(
-                out_csv,
-                mode="a",
-                index=False,
-                header=(not wrote_header),
-            )
-            wrote_header = True
-
-        total_output_rows += len(out)
-
-        print(
-            f"[CHUNK {chunk_index}] input={len(chunk):,} "
-            f"output={len(out):,} total_output={total_output_rows:,}"
+        out["internal_source"] = (
+            "CTD_curated_chemicals_diseases"
         )
 
-    if not out_csv.exists() or out_csv.stat().st_size == 0:
-        raise RuntimeError("Output CSV was not created or is empty.")
+    # Original CTD chemical identifiers are retained.
+    # A separate canonical MeSH identifier is added
+    # only when syntax can be recognised.
 
-    print_section("Output validation")
+    ids = out["chemical_id"].str.upper()
 
-    head = pd.read_csv(out_csv, dtype=str, nrows=10)
-
-    print("[OUTPUT HEAD]")
-    print(head.to_string(index=False))
-
-    # Read full output for summary. If memory becomes an issue, replace later
-    # with streaming summaries.
-    full = pd.read_csv(out_csv, dtype=str, low_memory=False).fillna("")
-
-    exact_duplicate_rows = int(full.duplicated().sum())
-
-    unique_chemicals = int(full["chemical_id"].nunique(dropna=True))
-    unique_chemical_names = int(full["chemical_name"].nunique(dropna=True))
-    unique_diseases = int(full["disease_id"].nunique(dropna=True))
-    unique_disease_names = int(full["disease_name"].nunique(dropna=True))
-
-    unique_pairs = int(
-        full[
-            [
-                "drug_identifier",
-                "disease_or_condition_identifier",
-            ]
-        ]
-        .drop_duplicates()
-        .shape[0]
+    valid = ids.str.fullmatch(
+        r"[CD]\d{6,9}"
     )
 
-    evidence_counts = (
-        full["direct_evidence"]
-        .fillna("")
-        .replace("", "Missing")
-        .value_counts()
-        .head(30)
-        .reset_index()
-    )
-    evidence_counts.columns = ["direct_evidence", "n"]
-
-    relationship_type_counts = (
-        full["relationship_type"]
-        .value_counts()
-        .to_dict()
+    out["drug_identifier_original"] = (
+        out["chemical_id"]
     )
 
-    evidence_type_counts = (
-        full["evidence_type"]
-        .value_counts()
-        .to_dict()
+    out["drug_identifier_namespace"] = (
+        valid.map({
+            True: "MeSH",
+            False: "unresolved",
+        })
     )
 
-    disease_identifier_type_counts = (
-        full["disease_or_condition_identifier_type"]
-        .value_counts()
-        .to_dict()
+    out["drug_identifier_canonical"] = (
+        "MESH:" + ids
+    ).where(valid, "")
+
+    out["drug_identifier_validation"] = (
+        valid.map({
+            True: "syntax_valid",
+            False: "unresolved_or_invalid",
+        })
     )
 
-    print("\n[OUTPUT SUMMARY]")
-    print(f"Input rows processed:          {total_input_rows:,}")
-    print(f"Output rows:                   {len(full):,}")
-    print(f"Exact duplicate rows:          {exact_duplicate_rows:,}")
-    print(f"Unique chemical IDs:           {unique_chemicals:,}")
-    print(f"Unique chemical names:         {unique_chemical_names:,}")
-    print(f"Unique disease IDs:            {unique_diseases:,}")
-    print(f"Unique disease names:          {unique_disease_names:,}")
-    print(f"Unique chemical-disease pairs: {unique_pairs:,}")
-    print(f"Output SHA256:                 {sha256_file(out_csv)}")
+    out["drug_identifier_type"] = (
+        out["drug_identifier_namespace"]
+    )
 
-    print("\n[DIRECT EVIDENCE COUNTS TOP 30]")
-    print(evidence_counts.to_string(index=False))
+    out["disease_identifier_original"] = (
+        out["disease_id"]
+    )
 
-    return {
-        "output_file": str(out_csv),
-        "output_size_bytes": out_csv.stat().st_size,
-        "output_sha256": sha256_file(out_csv),
-        "input_rows_processed": int(total_input_rows),
-        "output_rows": int(len(full)),
-        "exact_duplicate_rows": exact_duplicate_rows,
-        "unique_chemical_ids": unique_chemicals,
-        "unique_chemical_names": unique_chemical_names,
-        "unique_disease_ids": unique_diseases,
-        "unique_disease_names": unique_disease_names,
-        "unique_chemical_disease_pairs": unique_pairs,
-        "missing_counts": missing_counts,
-        "direct_evidence_counts_top30": evidence_counts.to_dict(
-            orient="records"
-        ),
-        "relationship_type_counts": relationship_type_counts,
-        "evidence_type_counts": evidence_type_counts,
-        "disease_identifier_type_counts": disease_identifier_type_counts,
-        "output_columns": list(full.columns),
-        "output_head": head.to_dict(orient="records"),
-    }
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Download and process CTD chemical-disease associations into "
-            "a unified drug-disease-compatible schema."
+    namespace, canonical, status = (
+        disease_identifier_metadata(
+            out["disease_id"]
         )
     )
 
-    parser.add_argument(
+    out["disease_identifier_namespace"] = namespace
+
+    out["disease_identifier_canonical"] = canonical
+
+    out["disease_identifier_validation"] = status
+
+    out["disease_or_condition_identifier_type"] = (
+        namespace
+    )
+
+    return (
+        out.loc[:, COLUMNS],
+        empty_core,
+        int((~mask).sum()),
+    )
+
+
+def main():
+
+    ap = argparse.ArgumentParser(
+        description=__doc__
+    )
+
+    ap.add_argument(
         "--subset",
-        choices=["aggregate", "curated"],
+        choices=list(URLS),
         default="aggregate",
-        help=(
-            "CTD subset to process. Use aggregate for broad coverage; "
-            "curated for conservative curated-only associations."
-        ),
     )
 
-    parser.add_argument(
-        "--url",
-        default=None,
-        help=(
-            "Optional custom CTD URL. If omitted, uses the official URL "
-            "for the selected subset."
-        ),
-    )
-
-    parser.add_argument(
+    ap.add_argument(
         "--workdir",
-        default="./data/raw/ctd",
-        help="Directory for downloaded CTD files.",
+        default=str(
+            ROOT / "data/raw/ctd"
+        ),
     )
 
-    parser.add_argument(
+    ap.add_argument(
         "--out",
         default=None,
-        help="Output CSV path. If omitted, subset-specific default is used.",
     )
 
-    parser.add_argument(
+    ap.add_argument(
         "--metadata",
         default=None,
-        help="Metadata JSON path. If omitted, subset-specific default is used.",
     )
 
-    parser.add_argument(
+    ap.add_argument(
+        "--url",
+        default=None,
+    )
+
+    ap.add_argument(
         "--chunksize",
         type=int,
-        default=250_000,
-        help="Rows per chunk for streaming processing.",
+        default=100_000,
     )
 
-    parser.add_argument(
+    ap.add_argument(
         "--head_n",
         type=int,
-        default=10,
-        help="Number of rows to print in previews.",
+        default=3,
     )
 
-    parser.add_argument(
+    ap.add_argument(
+        "--download_missing",
+        action="store_true",
+    )
+
+    ap.add_argument(
         "--force_download",
         action="store_true",
-        help="Force re-download even if file already exists.",
     )
 
-    parser.add_argument(
+    ap.add_argument(
         "--skip_gzip_test",
         action="store_true",
-        help=(
-            "Skip full gzip integrity test. Useful for speed if the file "
-            "was already checked."
-        ),
     )
 
-    args = parser.parse_args()
+    args = ap.parse_args()
+
+    if args.chunksize < 1:
+        ap.error(
+            "--chunksize must be positive"
+        )
 
     subset = args.subset
-    url = args.url or CTD_URLS[subset]
 
-    workdir = Path(args.workdir).resolve()
-    workdir.mkdir(parents=True, exist_ok=True)
+    workdir = (
+        Path(args.workdir)
+        .expanduser()
+        .resolve()
+    )
 
-    out_csv = (
-        Path(args.out).resolve()
+    output = (
+        Path(args.out)
+        .expanduser()
+        .resolve()
         if args.out
-        else Path(
-            f"./data/processed/ctd_{subset}_chemical_disease.csv"
-        ).resolve()
+        else (
+            ROOT
+            / "data/processed"
+            / f"ctd_{subset}_chemical_disease.csv"
+        )
     )
 
-    metadata_path = (
-        Path(args.metadata).resolve()
+    metadata = (
+        Path(args.metadata)
+        .expanduser()
+        .resolve()
         if args.metadata
-        else Path(
-            f"./data/metadata/ctd_{subset}_processing_metadata.json"
-        ).resolve()
+        else (
+            ROOT
+            / "data/metadata"
+            / f"ctd_{subset}_processing_metadata.json"
+        )
     )
 
-    gz_path = workdir / Path(url).name
+    source_url = args.url or URLS[subset]
 
-    metadata = {
-        "script": "ctd_to_drug_disease.py",
+    rawname = Path(
+        urlparse(source_url).path
+    ).name
+
+    if not rawname.endswith(".tsv.gz"):
+        ap.error(
+            "CTD source URL must end with .tsv.gz"
+        )
+
+    workdir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    infile = workdir / rawname
+
+    temp = output.with_name(
+        output.name + ".processing.tmp"
+    )
+
+    report = {
+        "status": "started",
+        "started_at_utc": now(),
         "source": "CTD",
         "subset": subset,
-        "source_url": url,
-        "relationship_type": "chemical_disease_association",
-        "started_at_utc": now_utc(),
-        "interpretation": (
-            "CTD records represent chemical-disease associations and are not "
-            "necessarily therapeutic drug indications. CTD chemical identifiers "
-            "are copied into drug-compatible unified fields only for harmonisation."
+        "download_url": source_url,
+        "source_semantics": (
+            "chemical-disease associations, "
+            "not proof of drug approval"
         ),
-        "unified_output_columns": CTD_OUTPUT_COLUMNS,
+        "columns": COLUMNS,
     }
 
     try:
-        print_section("CTD -> unified chemical/drug-disease association processing")
-        print(f"[SUBSET] {subset}")
-        print(f"[URL] {url}")
-        print(f"[WORKDIR] {workdir}")
-        print(f"[OUTPUT] {out_csv}")
 
-        gz_path = download_file(
-            url=url,
-            out_path=gz_path,
-            force=args.force_download,
-            timeout=1800,
+        download_if_needed(
+            infile,
+            source_url,
+            args.download_missing
+            or args.force_download,
+            args.force_download,
         )
 
-        metadata["downloaded_file"] = {
-            "path": str(gz_path),
-            "size_bytes": gz_path.stat().st_size,
-            "sha256": sha256_file(gz_path),
+        report["raw_file_inventory"] = (
+            scan_raw_directory(
+                workdir,
+                infile,
+            )
+        )
+
+        report["raw_file"] = {
+            "path": str(infile),
+            "size_bytes": infile.stat().st_size,
+            "sha256": sha256(infile),
         }
 
-        if not args.skip_gzip_test:
-            test_gzip_integrity(gz_path)
-            metadata["gzip_integrity_check"] = "pass"
-        else:
-            print("[SKIP] GZIP integrity check skipped by user.")
-            metadata["gzip_integrity_check"] = "skipped"
-
-        header_line, comment_preview, header_columns = find_header_line_gz(
-            gz_path
+        report["gzip_uncompressed_bytes"] = (
+            None
+            if args.skip_gzip_test
+            else check_gzip(infile)
         )
 
-        metadata["comment_preview"] = comment_preview
-        metadata["header_line"] = header_line
-        metadata["header_columns"] = header_columns
-
-        metadata["input_inspection"] = inspect_input_file(
-            path=gz_path,
-            header_line=header_line,
-            header_columns=header_columns,
-            head_n=args.head_n,
+        header_line, original_cols = (
+            inspect_header(infile)
         )
 
-        metadata["processing"] = process_ctd_file(
-            gz_path=gz_path,
-            out_csv=out_csv,
-            subset=subset,
-            header_line=header_line,
+        report["header_file_line"] = (
+            header_line + 1
+        )
+
+        report["original_columns"] = original_cols
+
+        raw_head = pd.read_csv(
+            infile,
+            compression="gzip",
+            sep="\t",
+            skiprows=header_line + 1,
+            header=None,
+            names=original_cols,
+            nrows=max(1, args.head_n),
+            dtype=str,
+            keep_default_na=False,
+            on_bad_lines="error",
+            encoding="utf-8-sig",
+        )
+
+        print(
+            "Original source-record preview "
+            "(first data row):"
+        )
+
+        if not raw_head.empty:
+            for field, value in (
+                raw_head.iloc[0].items()
+            ):
+                print(
+                    f"  {field:35} "
+                    f"{str(value)[:140]}"
+                )
+
+        report["raw_record_preview"] = (
+            raw_head.head(
+                args.head_n
+            ).to_dict("records")
+        )
+
+        heading(
+            "4. SOURCE-TO-OUTPUT MAPPING, "
+            "EVIDENCE AND JOIN STRATEGY"
+        )
+
+        print(
+            "ONE FILE; NO SQL JOIN. Each eligible "
+            "input row becomes one evidence record."
+        )
+
+        print(
+            "ChemicalName/ChemicalID -> "
+            "drug_name/identifier "
+            "(chemical != approved drug)"
+        )
+
+        print(
+            "DiseaseName/DiseaseID -> "
+            "disease_or_condition_name/identifier"
+        )
+
+        print(
+            "DirectEvidence + inference fields -> "
+            "ctd_evidence_class"
+        )
+
+        print(
+            "Core relationship/evidence types "
+            "preserve direct vs inferred distinctions."
+        )
+
+        print(
+            "Ten common merge fields first; "
+            "original evidence and identifiers follow."
+        )
+
+        print(
+            "Source row numbers begin at 1 "
+            "after the header, across chunks."
+        )
+
+        print(
+            "The source-event output is NOT "
+            "prematurely deduplicated."
+        )
+
+        counts = Counter()
+        classes = Counter()
+        direct_values = Counter()
+        drug_validation = Counter()
+        disease_validation = Counter()
+        disease_ns = Counter()
+        missing = Counter()
+
+        sample_rows = []
+
+        output.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        # Temporary output, committed only on success.
+        with temp.open(
+            "w",
+            encoding="utf-8",
+            newline="",
+        ) as f:
+            import csv
+            csv.writer(f).writerow(
+                COLUMNS
+            )
+
+        reader = pd.read_csv(
+            infile,
+            compression="gzip",
+            sep="\t",
+            skiprows=header_line + 1,
+            header=None,
+            names=original_cols,
+            dtype=str,
+            keep_default_na=False,
             chunksize=args.chunksize,
+            on_bad_lines="error",
+            encoding="utf-8-sig",
+            low_memory=False,
         )
 
-        metadata["finished_at_utc"] = now_utc()
-        metadata["status"] = "success"
+        for n, chunk in enumerate(
+            reader,
+            start=1,
+        ):
 
-    except Exception as e:
-        metadata["finished_at_utc"] = now_utc()
-        metadata["status"] = "failed"
-        metadata["error"] = repr(e)
+            counts["rows_raw"] += len(chunk)
+
+            out, core_missing, rejected = (
+                transform(
+                    chunk,
+                    subset,
+                )
+            )
+
+            missing.update(
+                core_missing
+            )
+
+            counts[
+                "rows_rejected_missing_core"
+            ] += rejected
+
+            counts["rows_output"] += len(out)
+
+            if not out.empty:
+
+                if len(sample_rows) < args.head_n:
+                    sample_rows.extend(
+                        out.head(
+                            args.head_n
+                            - len(sample_rows)
+                        ).to_dict("records")
+                    )
+
+                classes.update(
+                    out["ctd_evidence_class"]
+                    .value_counts()
+                    .to_dict()
+                )
+
+                direct_values.update(
+                    out["direct_evidence"]
+                    .replace("", "[empty]")
+                    .value_counts()
+                    .to_dict()
+                )
+
+                drug_validation.update(
+                    out["drug_identifier_validation"]
+                    .value_counts()
+                    .to_dict()
+                )
+
+                disease_validation.update(
+                    out["disease_identifier_validation"]
+                    .value_counts()
+                    .to_dict()
+                )
+
+                disease_ns.update(
+                    out["disease_identifier_namespace"]
+                    .value_counts()
+                    .to_dict()
+                )
+
+                counts[
+                    "rows_direct_and_inferred"
+                ] += int((
+                    out["ctd_has_direct_evidence"]
+                    & out["ctd_has_inference_evidence"]
+                ).sum())
+
+                counts[
+                    "rows_with_pubmed_ids"
+                ] += int(
+                    out["pubmed_ids"].ne("").sum()
+                )
+
+                out.to_csv(
+                    temp,
+                    mode="a",
+                    header=False,
+                    index=False,
+                )
+
+            print(
+                f"[CHUNK {n:04d}] "
+                f"raw={len(chunk):,} "
+                f"accepted={len(out):,} "
+                f"cumulative={counts['rows_output']:,}",
+                flush=True,
+            )
+
+        if (
+            counts["rows_raw"]
+            != counts["rows_output"]
+            + counts["rows_rejected_missing_core"]
+        ):
+            raise RuntimeError(
+                "Source-to-output row counts "
+                "do not reconcile"
+            )
+
+        if counts["rows_output"] == 0:
+            raise RuntimeError(
+                "No CTD rows passed validation; "
+                "existing output remains untouched"
+            )
+
+        heading(
+            "5. FINAL DATASET COUNTS "
+            "AND EVIDENCE DISTRIBUTION"
+        )
+
+        for label, number in sorted(
+            counts.items()
+        ):
+            print(
+                f"  {label:38} {number:,}"
+            )
+
+        print(
+            "  Nonexclusive missing-core counts:"
+        )
+
+        for label, number in sorted(
+            missing.items()
+        ):
+            print(
+                f"    {label:36} {number:,}"
+            )
+
+        print("  CTD evidence classes:")
+
+        for label, number in (
+            classes.most_common()
+        ):
+            print(
+                f"    {label:48} {number:,}"
+            )
+
+        print("  Original DirectEvidence values:")
+
+        for label, number in (
+            direct_values.most_common()
+        ):
+            print(
+                f"    {label:48} {number:,}"
+            )
+
+        print(
+            "  Disease identifier namespace counts:"
+        )
+
+        for label, number in (
+            disease_ns.most_common()
+        ):
+            print(
+                f"    {label:36} {number:,}"
+            )
+
+        heading(
+            "6. COMPLETE MERGE SCHEMA "
+            "AND REAL OUTPUT SAMPLE"
+        )
+
+        print(
+            f"Output fields ({len(COLUMNS)}): "
+            + " | ".join(COLUMNS)
+        )
+
+        if sample_rows:
+            print(
+                "First accepted source record:"
+            )
+
+            for k, v in (
+                sample_rows[0].items()
+            ):
+                print(
+                    f"  {k:39} "
+                    f"{str(v)[:130]}"
+                )
+
+        report.update({
+            "input_rows":
+                counts["rows_raw"],
+
+            "output_rows":
+                counts["rows_output"],
+
+            "filtered_rows":
+                counts["rows_rejected_missing_core"],
+
+            "counts":
+                dict(counts),
+
+            "missing_input_fields_nonexclusive":
+                dict(missing),
+
+            "direct_evidence_counts":
+                dict(direct_values),
+
+            "ctd_evidence_class_counts":
+                dict(classes),
+
+            "drug_identifier_validation":
+                dict(drug_validation),
+
+            "disease_identifier_validation":
+                dict(disease_validation),
+
+            "disease_namespace_counts":
+                dict(disease_ns),
+
+            "sample_rows":
+                sample_rows,
+
+            "processing": {
+                "join": "none",
+                "combine": (
+                    "one input row -> "
+                    "one source evidence event"
+                ),
+                "filter": (
+                    "four nonempty identity fields"
+                ),
+                "deduplication": (
+                    "none at evidence-event stage"
+                ),
+                "merger_requirement": (
+                    "preserve evidence events; "
+                    "do not deduplicate on only "
+                    "nine common fields"
+                ),
+            },
+        })
+
+        # Commit the complete output only after
+        # all processing and row checks pass.
+        temp.replace(output)
+
+        report["output_file"] = str(output)
+
+        report["output_file_sha256"] = (
+            sha256(output)
+        )
+
+        report["finished_at_utc"] = now()
+
+        report["status"] = "success"
+
+        atomic_json(
+            report,
+            metadata,
+        )
+
+        heading(
+            "SUCCESS: CTD OUTPUTS OVERWRITTEN "
+            "IN ORIGINAL DIRECTORIES"
+        )
+
+        print("Main CSV:", output)
+        print("Metadata:", metadata)
+        print(
+            "Rows:",
+            f"{counts['rows_output']:,}",
+        )
+
+        print(
+            "The main merger must still be "
+            "updated before the final "
+            "integrated rebuild."
+        )
+
+    except Exception as exc:
+
+        report["finished_at_utc"] = now()
+        report["status"] = "failed"
+        report["error"] = repr(exc)
+
+        failure = metadata.with_name(
+            f"ctd_{subset}_failed_run.json"
+        )
+
+        atomic_json(
+            report,
+            failure,
+        )
+
+        print(
+            "FAILED. Check the diagnostic JSON. "
+            "Error:",
+            repr(exc),
+        )
+
         raise
 
     finally:
-        metadata_path.parent.mkdir(parents=True, exist_ok=True)
-
-        with open(metadata_path, "w", encoding="utf-8") as f:
-            json.dump(metadata, f, indent=2)
-
-        print_section("METADATA WRITTEN")
-        print(metadata_path)
+        temp.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

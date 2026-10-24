@@ -1,291 +1,1288 @@
+
 #!/usr/bin/env python3
+"""Inspect (do not merge) pinned openFDA Human Drug Label partitions.
+
+Examples:
+  python inspect_openfda_fields.py --download-missing
+  python inspect_openfda_fields.py --all-partitions --max-records 25 --download-missing
+  python inspect_openfda_fields.py --all-partitions --full-scan --download-missing
+
+A sampled inspection cannot demonstrate that a field is absent
+from all labels.
+
+FDA indication sections contain narrative text, not automatically
+verified drug-disease ontology relationships.
 """
-Inspect openFDA Human Drug Label download metadata and record fields.
-
-This does NOT extract drug-disease mappings.
-It only shows:
-  1. What openFDA drug/label files are available for download.
-  2. What fields exist inside the JSON records.
-  3. What the indication/contraindication/warning sections actually look like.
-  4. Whether there are exact structured disease terms available.
-
-Run:
-  python inspect_openfda_fields.py
-
-Optional:
-  python inspect_openfda_fields.py --max-records 20
-"""
-
 from __future__ import annotations
 
 import argparse
+import csv
+import hashlib
 import json
-import zipfile
+
 from collections import Counter, defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
+from zipfile import ZipFile
 
 import requests
 
+try:
+    import ijson
+except ImportError as exc:
+    raise SystemExit(
+        "Missing dependency ijson. Install with: "
+        "python -m pip install ijson requests"
+    ) from exc
 
-OPENFDA_DOWNLOAD_JSON = "https://api.fda.gov/download.json"
 
-RAW_DIR = Path(
-    "/data/ascher02/uqmmune1/ANNOVAR/drug_disease_data/"
-    "drug-disease-mapping/data/raw/openfda_drug_label"
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+ROOT = Path(__file__).resolve().parent
+
+RAW = ROOT / "data/raw/openfda_drug_label"
+
+INSPECT = (
+    ROOT / "data/processed/openfda/inspection"
 )
 
-INSPECT_DIR = Path(
-    "/data/ascher02/uqmmune1/ANNOVAR/drug_disease_data/"
-    "drug-disease-mapping/data/processed/openfda/inspection"
+MANIFEST_URL = "https://api.fda.gov/download.json"
+
+SECTIONS = (
+    "indications_and_usage",
+    "purpose",
+    "uses",
+    "contraindications",
+    "warnings",
+    "warnings_and_precautions",
+    "boxed_warning",
+    "adverse_reactions",
+    "clinical_studies",
+    "description",
+    "dosage_and_administration",
+    "use_in_specific_populations",
+)
+
+IDENTIFIERS = (
+    "brand_name",
+    "generic_name",
+    "substance_name",
+    "rxcui",
+    "product_ndc",
+    "application_number",
+    "spl_id",
+    "spl_set_id",
+    "product_type",
 )
 
 
-def filename_from_url(url: str, index: int) -> str:
-    name = Path(urlparse(url).path).name
-    if not name:
-        name = f"drug-label-{index:04d}.json.zip"
-    if not name.endswith(".zip"):
-        name += ".zip"
+# ============================================================
+# UTILITIES
+# ============================================================
+
+def now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def section(name):
+    print(
+        "\n" + "=" * 90
+        + "\n" + name
+        + "\n" + "=" * 90,
+        flush=True,
+    )
+
+
+def sha256(path):
+    h = hashlib.sha256()
+
+    with path.open("rb") as f:
+        for block in iter(
+            lambda: f.read(4 * 1024 * 1024),
+            b"",
+        ):
+            h.update(block)
+
+    return h.hexdigest()
+
+
+def write_json(obj, path):
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    temp = path.with_name(
+        path.name + ".tmp"
+    )
+
+    try:
+        temp.write_text(
+            json.dumps(
+                obj,
+                indent=2,
+                ensure_ascii=False,
+                default=str,
+            ) + "\n",
+            encoding="utf-8",
+        )
+
+        temp.replace(path)
+
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+# ============================================================
+# PINNED MANIFEST
+# ============================================================
+
+def pinned_manifest(path, refresh=False):
+
+    if path.is_file() and not refresh:
+        print(
+            "[REUSE PINNED MANIFEST]",
+            path,
+        )
+
+        return json.loads(
+            path.read_text(
+                encoding="utf-8"
+            )
+        )
+
+    print(
+        "[FETCH MANIFEST]",
+        MANIFEST_URL,
+    )
+
+    r = requests.get(
+        MANIFEST_URL,
+        timeout=(20, 120),
+    )
+
+    r.raise_for_status()
+
+    manifest = r.json()
+
+    label = (
+        manifest.get("results", {})
+        .get("drug", {})
+        .get("label", {})
+    )
+
+    if (
+        not isinstance(
+            label.get("partitions"),
+            list,
+        )
+        or not label["partitions"]
+    ):
+        raise RuntimeError(
+            "Manifest lacks "
+            "results.drug.label.partitions"
+        )
+
+    # Avoid mixing older downloaded partitions
+    # with a newly refreshed manifest.
+    if refresh and path.is_file():
+
+        old = json.loads(
+            path.read_text(
+                encoding="utf-8"
+            )
+        )
+
+        old_label = (
+            old.get("results", {})
+            .get("drug", {})
+            .get("label", {})
+        )
+
+        changed = (
+            old_label.get("export_date")
+            != label.get("export_date")
+            or old_label.get("partitions")
+            != label.get("partitions")
+        )
+
+        if changed:
+            existing_zips = list(
+                path.parent.glob("*.zip")
+            )
+
+            if existing_zips:
+                raise RuntimeError(
+                    "Manifest release changed, "
+                    "but old ZIPs exist. "
+                    "Do not mix snapshots. "
+                    "Keep the pinned manifest "
+                    "or archive/move existing ZIPs "
+                    "before refreshing."
+                )
+
+    write_json(
+        manifest,
+        path,
+    )
+
+    return manifest
+
+
+# ============================================================
+# PARTITION DOWNLOAD
+# ============================================================
+
+def part_filename(part):
+
+    url = str(
+        part.get("file", "")
+    )
+
+    parsed = urlparse(url)
+
+    if parsed.hostname != "download.open.fda.gov":
+        raise RuntimeError(
+            "Unexpected openFDA partition host: "
+            + url
+        )
+
+    name = Path(
+        parsed.path
+    ).name
+
+    if (
+        not name.endswith(".json.zip")
+        or name in {".", ".."}
+    ):
+        raise RuntimeError(
+            "Unexpected partition filename: "
+            + name
+        )
+
     return name
 
 
-def get_openfda_partitions():
-    print("=" * 100)
-    print("READING openFDA DOWNLOAD MANIFEST")
-    print("=" * 100)
+def download_partition(
+    part,
+    raw,
+    download_missing,
+):
 
-    print(f"[URL] {OPENFDA_DOWNLOAD_JSON}")
+    name = part_filename(part)
 
-    r = requests.get(OPENFDA_DOWNLOAD_JSON, timeout=120)
-    r.raise_for_status()
-    metadata = r.json()
+    dest = raw / name
 
-    partitions = metadata["results"]["drug"]["label"]["partitions"]
+    if (
+        dest.is_file()
+        and dest.stat().st_size
+    ):
+        print(
+            "[REUSE PARTITION]",
+            name,
+        )
 
-    print(f"[INFO] Number of drug/label partitions: {len(partitions)}")
+        return dest
 
-    print()
-    print("[FIRST 10 PARTITIONS]")
-    for i, part in enumerate(partitions[:10], start=1):
-        print("-" * 100)
-        print(f"Partition {i}")
-        print(f"  file:    {part.get('file')}")
-        print(f"  records: {part.get('records')}")
-        print(f"  size_mb: {part.get('size_mb')}")
+    if not download_missing:
+        raise FileNotFoundError(
+            f"Missing {dest}; "
+            "use --download-missing "
+            "to obtain this pinned partition"
+        )
 
-    return partitions
+    url = str(
+        part["file"]
+    )
 
+    if url.startswith(
+        "http://download.open.fda.gov/"
+    ):
+        url = (
+            "https://"
+            + url[len("http://"):]
+        )
 
-def download_first_partition_if_missing(partitions):
-    RAW_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(
+        dest.name + ".download"
+    )
 
-    part = partitions[0]
-    url = part["file"]
-    zip_path = RAW_DIR / filename_from_url(url, 1)
+    try:
+        print(
+            "[DOWNLOAD]",
+            url,
+        )
 
-    if zip_path.exists() and zip_path.stat().st_size > 0:
-        print()
-        print(f"[CACHE] Using existing first ZIP: {zip_path}")
-        return zip_path
+        with requests.get(
+            url,
+            stream=True,
+            timeout=(30, 1200),
+        ) as r:
 
-    print()
-    print("=" * 100)
-    print("DOWNLOADING FIRST openFDA LABEL ZIP FOR INSPECTION")
-    print("=" * 100)
-    print(f"[URL] {url}")
-    print(f"[OUT] {zip_path}")
+            r.raise_for_status()
 
-    with requests.get(url, stream=True, timeout=300) as r:
-        r.raise_for_status()
-        with open(zip_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    f.write(chunk)
+            with tmp.open("wb") as output:
+                for chunk in r.iter_content(
+                    chunk_size=4 * 1024 * 1024
+                ):
+                    if chunk:
+                        output.write(chunk)
 
-    print(f"[SAVED] {zip_path}")
-    print(f"[SIZE] {zip_path.stat().st_size / 1e6:.2f} MB")
+        with ZipFile(tmp) as z:
+            if not any(
+                x.endswith(".json")
+                for x in z.namelist()
+            ):
+                raise RuntimeError(
+                    "Downloaded ZIP contains "
+                    "no JSON member: " + name
+                )
 
-    return zip_path
+        tmp.replace(dest)
 
+    finally:
+        tmp.unlink(missing_ok=True)
 
-def iter_records_from_zip(zip_path: Path, max_records: int):
-    count = 0
-
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        members = [m for m in zf.namelist() if m.endswith(".json")]
-
-        print()
-        print("=" * 100)
-        print("ZIP CONTENTS")
-        print("=" * 100)
-        print(f"[ZIP] {zip_path}")
-        print(f"[JSON MEMBERS] {members}")
-
-        for member in members:
-            with zf.open(member) as handle:
-                data = json.load(handle)
-
-            print()
-            print("[TOP-LEVEL JSON KEYS]")
-            print(list(data.keys()))
-
-            print()
-            print("[META]")
-            print(json.dumps(data.get("meta", {}), indent=2)[:3000])
-
-            results = data.get("results", [])
-
-            print()
-            print(f"[RESULTS COUNT IN THIS JSON] {len(results):,}")
-
-            for record in results:
-                yield record
-                count += 1
-                if count >= max_records:
-                    return
+    return dest
 
 
-def short_value_preview(value, max_chars=500):
-    if isinstance(value, list):
-        text = " ".join(str(x) for x in value[:3])
-    elif isinstance(value, dict):
-        text = json.dumps(value, ensure_ascii=False)[:max_chars]
-    else:
-        text = str(value)
+# ============================================================
+# RECORD INSPECTION
+# ============================================================
 
-    text = text.replace("\n", " ").replace("\r", " ").strip()
+def preview(value, limit=650):
 
-    if len(text) > max_chars:
-        text = text[:max_chars] + "..."
+    if isinstance(
+        value,
+        (list, dict),
+    ):
+        value = json.dumps(
+            value,
+            ensure_ascii=False,
+        )
 
-    return text
+    text = " ".join(
+        str(value).split()
+    )
+
+    return (
+        text[:limit]
+        + (
+            "…"
+            if len(text) > limit
+            else ""
+        )
+    )
 
 
-def inspect_records(records):
-    field_counts = Counter()
-    openfda_field_counts = Counter()
+def looks_like_structured_disease_key(path):
+    """
+    Detect possible structured disease-code
+    field names for manual review.
+
+    This does NOT verify disease ontology mapping.
+    """
+
+    tokens = path.lower()
+
+    related = any(
+        word in tokens
+        for word in (
+            "disease",
+            "diagnos",
+            "condition",
+            "indication",
+        )
+    )
+
+    explicit = any(
+        word in tokens
+        for word in (
+            "_id",
+            "_code",
+            "_cui",
+            "ontology",
+            "_mesh",
+            "_icd",
+            "_snomed",
+        )
+    )
+
+    return related and explicit
+
+
+# ============================================================
+# STREAMING ZIP INSPECTION
+# ============================================================
+
+def scan_zip(
+    path,
+    max_records,
+    full_scan,
+    verify_zip,
+):
+
+    totals = Counter()
+
+    fields = Counter()
+    openfda_fields = Counter()
+
+    field_types = defaultdict(Counter)
+
     section_examples = defaultdict(list)
+    identifier_examples = defaultdict(list)
 
-    all_record_keys = set()
-    all_openfda_keys = set()
+    candidate_disease_fields = Counter()
 
-    sections_of_interest = [
-        "indications_and_usage",
-        "contraindications",
-        "warnings",
-        "warnings_and_precautions",
-        "adverse_reactions",
-        "use_in_specific_populations",
-        "clinical_studies",
-        "description",
-        "dosage_and_administration",
-    ]
+    first_meta = None
+    sample_record = None
 
-    print()
-    print("=" * 100)
-    print("INSPECTING RECORDS")
-    print("=" * 100)
+    if verify_zip:
+        with ZipFile(path) as z:
+            bad = z.testzip()
 
-    example_records = []
+            if bad:
+                raise RuntimeError(
+                    f"ZIP CRC failed for "
+                    f"{path.name}: {bad}"
+                )
 
-    for i, record in enumerate(records, start=1):
-        keys = sorted(record.keys())
-        all_record_keys.update(keys)
+        print(
+            "[ZIP CRC] PASS",
+            path.name,
+        )
 
-        for k in keys:
-            field_counts[k] += 1
+    with ZipFile(path) as z:
 
-        openfda = record.get("openfda", {})
-        if isinstance(openfda, dict):
-            for k in openfda.keys():
-                openfda_field_counts[k] += 1
-                all_openfda_keys.add(k)
+        zip_members = [
+            info.filename
+            for info in z.infolist()
+            if info.filename.endswith(".json")
+        ]
 
-        for sec in sections_of_interest:
-            if sec in record and len(section_examples[sec]) < 5:
-                section_examples[sec].append(short_value_preview(record[sec], max_chars=700))
+        if not zip_members:
+            raise RuntimeError(
+                f"No JSON entries in {path}"
+            )
 
-        if len(example_records) < 3:
-            example_records.append(record)
+        for member in zip_members:
 
-    print()
-    print("[ALL RECORD-LEVEL FIELDS FOUND]")
-    for k in sorted(all_record_keys):
-        print(f"  - {k}")
+            # Read only the small metadata object.
+            with z.open(member) as stream:
 
-    print()
-    print("[ALL openfda SUBFIELDS FOUND]")
-    for k in sorted(all_openfda_keys):
-        print(f"  - openfda.{k}")
+                meta_iter = ijson.items(
+                    stream,
+                    "meta",
+                )
 
-    print()
-    print("[MOST COMMON RECORD FIELDS]")
-    for k, v in field_counts.most_common(50):
-        print(f"  {k}: {v}")
+                if first_meta is None:
+                    first_meta = next(
+                        meta_iter,
+                        {},
+                    )
 
-    print()
-    print("[MOST COMMON openfda FIELDS]")
-    for k, v in openfda_field_counts.most_common(50):
-        print(f"  openfda.{k}: {v}")
+            # Stream result objects without
+            # loading the entire JSON document.
+            with z.open(member) as stream:
 
-    print()
-    print("=" * 100)
-    print("SECTION EXAMPLES")
-    print("=" * 100)
+                for record in ijson.items(
+                    stream,
+                    "results.item",
+                ):
 
-    for sec in sections_of_interest:
-        print()
-        print("-" * 100)
-        print(f"[SECTION] {sec}")
-        examples = section_examples.get(sec, [])
-        if not examples:
-            print("No examples found in sampled records.")
-            continue
+                    if not isinstance(
+                        record,
+                        dict,
+                    ):
+                        raise RuntimeError(
+                            "Non-object label in "
+                            f"{path.name}:{member}"
+                        )
 
-        for j, ex in enumerate(examples, start=1):
-            print()
-            print(f"Example {j}:")
-            print(ex)
+                    totals["records"] += 1
+
+                    if sample_record is None:
+                        sample_record = {
+                            k: preview(v, 200)
+                            for k, v in record.items()
+                            if k != "openfda"
+                        }
+
+                    locator = {
+                        "partition": path.name,
+                        "record_index":
+                            totals["records"],
+                        "id": str(
+                            record.get("id", "")
+                        ),
+                        "set_id": str(
+                            record.get("set_id", "")
+                        ),
+                        "effective_time": str(
+                            record.get(
+                                "effective_time",
+                                "",
+                            )
+                        ),
+                    }
+
+                    # --------------------------
+                    # All original record fields
+                    # --------------------------
+
+                    for key, value in record.items():
+
+                        fields[key] += 1
+
+                        field_types[key][
+                            type(value).__name__
+                        ] += 1
+
+                        if looks_like_structured_disease_key(
+                            key
+                        ):
+                            candidate_disease_fields[
+                                key
+                            ] += 1
+
+                    # --------------------------
+                    # Drug label text sections
+                    # --------------------------
+
+                    for key in SECTIONS:
+
+                        val = record.get(key)
+
+                        if val not in (
+                            None,
+                            "",
+                            [],
+                        ):
+                            totals[
+                                "section_" + key
+                            ] += 1
+
+                            if (
+                                len(
+                                    section_examples[key]
+                                ) < 3
+                            ):
+                                section_examples[
+                                    key
+                                ].append({
+                                    **locator,
+                                    "text_preview":
+                                        preview(val),
+                                })
+
+                    # --------------------------
+                    # openfda harmonised fields
+                    # --------------------------
+
+                    annotation = record.get(
+                        "openfda",
+                        {},
+                    )
+
+                    if not isinstance(
+                        annotation,
+                        dict,
+                    ):
+                        totals[
+                            "malformed_openfda"
+                        ] += 1
+
+                        annotation = {}
+
+                    for key in annotation:
+
+                        openfda_fields[
+                            key
+                        ] += 1
+
+                        path_key = (
+                            "openfda." + key
+                        )
+
+                        if looks_like_structured_disease_key(
+                            path_key
+                        ):
+                            candidate_disease_fields[
+                                path_key
+                            ] += 1
+
+                    for key in IDENTIFIERS:
+
+                        val = annotation.get(key)
+
+                        if val not in (
+                            None,
+                            "",
+                            [],
+                        ):
+                            totals[
+                                "identifier_" + key
+                            ] += 1
+
+                            if (
+                                len(
+                                    identifier_examples[key]
+                                ) < 3
+                            ):
+                                identifier_examples[
+                                    key
+                                ].append({
+                                    **locator,
+                                    "value_preview":
+                                        preview(
+                                            val,
+                                            200,
+                                        ),
+                                })
+
+                    if (
+                        not full_scan
+                        and totals["records"]
+                        >= max_records
+                    ):
+                        break
+
+            if (
+                not full_scan
+                and totals["records"]
+                >= max_records
+            ):
+                break
 
     return {
-        "record_fields": sorted(all_record_keys),
-        "openfda_fields": sorted(all_openfda_keys),
-        "record_field_counts": dict(field_counts),
-        "openfda_field_counts": dict(openfda_field_counts),
-        "section_examples": dict(section_examples),
-        "example_records": example_records,
+        "zip_members": zip_members,
+
+        "zip_crc_verified":
+            bool(verify_zip),
+
+        "meta": first_meta,
+
+        "sample_count":
+            int(totals["records"]),
+
+        "scan_complete":
+            full_scan,
+
+        "counters":
+            dict(totals),
+
+        "record_field_counts":
+            dict(fields),
+
+        "openfda_field_counts":
+            dict(openfda_fields),
+
+        "record_field_types": {
+            k: dict(v)
+            for k, v in field_types.items()
+        },
+
+        "section_examples":
+            dict(section_examples),
+
+        "identifier_examples":
+            dict(identifier_examples),
+
+        "candidate_disease_field_names":
+            dict(candidate_disease_fields),
+
+        "first_record_preview":
+            sample_record,
     }
 
 
+# ============================================================
+# MAIN
+# ============================================================
+
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--max-records", type=int, default=25)
-    args = parser.parse_args()
 
-    INSPECT_DIR.mkdir(parents=True, exist_ok=True)
+    p = argparse.ArgumentParser(
+        description=__doc__,
+    )
 
-    partitions = get_openfda_partitions()
+    p.add_argument(
+        "--raw-dir",
+        type=Path,
+        default=RAW,
+    )
 
-    zip_path = download_first_partition_if_missing(partitions)
+    p.add_argument(
+        "--inspect-dir",
+        type=Path,
+        default=INSPECT,
+    )
 
-    records = list(iter_records_from_zip(zip_path, max_records=args.max_records))
+    group = p.add_mutually_exclusive_group()
 
-    print()
-    print(f"[INFO] Records sampled: {len(records)}")
+    group.add_argument(
+        "--all-partitions",
+        action="store_true",
+    )
 
-    report = inspect_records(records)
+    group.add_argument(
+        "--partition",
+        type=int,
+        default=1,
+        help=(
+            "1-based partition number; "
+            "default: first partition"
+        ),
+    )
 
-    report_path = INSPECT_DIR / "openfda_field_inspection_report.json"
+    p.add_argument(
+        "--max-records",
+        type=int,
+        default=25,
+        help=(
+            "Sample size per partition; "
+            "ignored by --full-scan"
+        ),
+    )
 
-    with open(report_path, "w", encoding="utf-8") as f:
-        json.dump(report, f, indent=2, ensure_ascii=False)
+    p.add_argument(
+        "--full-scan",
+        action="store_true",
+        help=(
+            "Stream ALL records in selected ZIPs"
+        ),
+    )
 
-    print()
-    print("=" * 100)
-    print("DONE")
-    print("=" * 100)
-    print(f"[REPORT] {report_path}")
+    p.add_argument(
+        "--download-missing",
+        action="store_true",
+    )
+
+    p.add_argument(
+        "--refresh-manifest",
+        action="store_true",
+    )
+
+    p.add_argument(
+        "--verify-zip",
+        action="store_true",
+        help=(
+            "Verify ZIP CRC by fully "
+            "decompressing selected archives"
+        ),
+    )
+
+    args = p.parse_args()
+
+    if args.max_records < 1:
+        p.error(
+            "--max-records must be >= 1"
+        )
+
+    raw = args.raw_dir.resolve()
+    inspect = args.inspect_dir.resolve()
+
+    raw.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    inspect.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    # --------------------------------------------------------
+    # 1. Manifest
+    # --------------------------------------------------------
+
+    section(
+        "1. PINNED OPENFDA "
+        "DRUG-LABEL DOWNLOAD MANIFEST"
+    )
+
+    manifest_path = (
+        raw / "openfda_download_manifest.json"
+    )
+
+    manifest = pinned_manifest(
+        manifest_path,
+        args.refresh_manifest,
+    )
+
+    endpoint = (
+        manifest["results"]["drug"]["label"]
+    )
+
+    parts = endpoint["partitions"]
+
+    names = [
+        part_filename(x)
+        for x in parts
+    ]
+
+    if len(names) != len(set(names)):
+        raise RuntimeError(
+            "Two manifest partitions resolve "
+            "to the same ZIP filename"
+        )
+
+    print(
+        "Export date:",
+        endpoint.get(
+            "export_date",
+            "not reported",
+        ),
+    )
+
+    print(
+        "Partitions:",
+        len(parts),
+        "| reported records:",
+        endpoint.get(
+            "total_records",
+            "not reported",
+        ),
+    )
+
+    manifest_rows = []
+
+    for index, (
+        part,
+        name,
+    ) in enumerate(
+        zip(parts, names),
+        1,
+    ):
+
+        item = {
+            "partition_index": index,
+            "filename": name,
+            "records":
+                part.get("records"),
+            "size_mb":
+                part.get("size_mb"),
+            "url":
+                part["file"],
+        }
+
+        manifest_rows.append(item)
+
+        print(
+            f"  {index:2d}. {name}"
+            f" | records={part.get('records')}"
+            f" | size_mb={part.get('size_mb')}"
+        )
+
+    manifest_csv = (
+        inspect
+        / "openfda_label_partition_manifest.csv"
+    )
+
+    with manifest_csv.open(
+        "w",
+        encoding="utf-8",
+        newline="",
+    ) as stream:
+
+        writer = csv.DictWriter(
+            stream,
+            fieldnames=list(
+                manifest_rows[0]
+            ),
+        )
+
+        writer.writeheader()
+        writer.writerows(
+            manifest_rows
+        )
+
+    # --------------------------------------------------------
+    # 2. Partition selection
+    # --------------------------------------------------------
+
+    chosen = (
+        list(range(len(parts)))
+        if args.all_partitions
+        else [args.partition - 1]
+    )
+
+    if (
+        min(chosen) < 0
+        or max(chosen) >= len(parts)
+    ):
+        p.error(
+            "--partition must be between "
+            f"1 and {len(parts)}"
+        )
+
+    # --------------------------------------------------------
+    # 3. Local raw files
+    # --------------------------------------------------------
+
+    section(
+        "2. LOCAL RAW FILE INVENTORY"
+    )
+
+    local = []
+
+    for file in sorted(
+        raw.rglob("*")
+    ):
+
+        if file.is_file():
+
+            item = {
+                "path": str(
+                    file.relative_to(raw)
+                ),
+                "bytes":
+                    file.stat().st_size,
+            }
+
+            local.append(item)
+
+            print(
+                f"  {item['path']}"
+                f" | {item['bytes']:,} bytes"
+            )
+
+    # --------------------------------------------------------
+    # 4. Inspect selected partitions
+    # --------------------------------------------------------
+
+    aggregate_fields = Counter()
+    aggregate_openfda = Counter()
+
+    aggregate_sections = Counter()
+    aggregate_identifiers = Counter()
+
+    aggregate_candidates = Counter()
+
+    partition_reports = []
+
+    section(
+        "3. RECORD FIELDS, LABEL SECTIONS "
+        "AND PRODUCT IDENTIFIERS"
+    )
+
+    for idx in chosen:
+
+        part = parts[idx]
+
+        zip_path = download_partition(
+            part,
+            raw,
+            args.download_missing,
+        )
+
+        report = scan_zip(
+            zip_path,
+            args.max_records,
+            args.full_scan,
+            args.verify_zip,
+        )
+
+        manifest_count = int(
+            part["records"]
+        )
+
+        if (
+            args.full_scan
+            and report["sample_count"]
+            != manifest_count
+        ):
+            raise RuntimeError(
+                f"Record-count mismatch in "
+                f"{zip_path.name}: "
+                f"observed {report['sample_count']}, "
+                f"manifest {manifest_count}. "
+                "Check for corrupted or "
+                "mixed-snapshot files."
+            )
+
+        report["partition_index"] = (
+            idx + 1
+        )
+
+        report["filename"] = (
+            zip_path.name
+        )
+
+        report["manifest_records"] = (
+            manifest_count
+        )
+
+        report["manifest_size_mb"] = (
+            part.get("size_mb")
+        )
+
+        report["zip_size_bytes"] = (
+            zip_path.stat().st_size
+        )
+
+        report["zip_sha256"] = (
+            sha256(zip_path)
+        )
+
+        partition_reports.append(
+            report
+        )
+
+        aggregate_fields.update(
+            report["record_field_counts"]
+        )
+
+        aggregate_openfda.update(
+            report["openfda_field_counts"]
+        )
+
+        aggregate_sections.update({
+            k.removeprefix("section_"): v
+            for k, v
+            in report["counters"].items()
+            if k.startswith("section_")
+        })
+
+        aggregate_identifiers.update({
+            k.removeprefix("identifier_"): v
+            for k, v
+            in report["counters"].items()
+            if k.startswith("identifier_")
+        })
+
+        aggregate_candidates.update(
+            report[
+                "candidate_disease_field_names"
+            ]
+        )
+
+        print(
+            f"[{idx + 1}/{len(parts)}] "
+            f"{zip_path.name}: "
+            f"inspected="
+            f"{report['sample_count']:,}"
+            f" of {manifest_count:,}; "
+            f"full_scan={args.full_scan}"
+        )
+
+        print(
+            "  Indications-and-usage present:",
+            report["counters"].get(
+                "section_indications_and_usage",
+                0,
+            ),
+        )
+
+        print(
+            "  Record keys:",
+            ", ".join(
+                sorted(
+                    report[
+                        "record_field_counts"
+                    ]
+                )
+            ),
+        )
+
+        print(
+            "  openfda keys:",
+            ", ".join(
+                sorted(
+                    report[
+                        "openfda_field_counts"
+                    ]
+                )
+            ),
+        )
+
+        examples = report[
+            "section_examples"
+        ].get(
+            "indications_and_usage",
+            [],
+        )
+
+        for item in examples[:1]:
+            print(
+                "  Example indication text:",
+                item["text_preview"][:300],
+            )
+
+    # --------------------------------------------------------
+    # 5. Dataset summary
+    # --------------------------------------------------------
+
+    observed = sum(
+        x["sample_count"]
+        for x in partition_reports
+    )
+
+    full_census = bool(
+        args.full_scan
+        and len(chosen) == len(parts)
+    )
+
+    print(
+        "\nTotal records inspected:",
+        f"{observed:,}",
+    )
+
+    print(
+        "All partitions inspected:",
+        len(chosen) == len(parts),
+    )
+
+    print(
+        "Complete dataset field census:",
+        full_census,
+    )
+
+    print(
+        "\nLabel section frequencies:",
+        dict(aggregate_sections),
+    )
+
+    print(
+        "Drug/product identifier coverage:",
+        dict(aggregate_identifiers),
+    )
+
+    print(
+        "Candidate structured disease-ID "
+        "field names:",
+        dict(aggregate_candidates),
+    )
+
+    print(
+        "\nIMPORTANT: No indication-to-ontology "
+        "mappings are verified by this inspector."
+    )
+
+    print(
+        "Do not treat contraindications, "
+        "adverse reactions, pharmacologic "
+        "classes or incidental disease mentions "
+        "as therapeutic indications."
+    )
+
+    # --------------------------------------------------------
+    # 6. Complete inspection report
+    # --------------------------------------------------------
+
+    report = {
+        "status": "success",
+
+        "timestamp_utc": now(),
+
+        "report_type":
+            "inspection_only_no_association_extraction",
+
+        "manifest_url":
+            MANIFEST_URL,
+
+        "manifest_snapshot_file":
+            str(manifest_path),
+
+        "manifest_sha256":
+            sha256(manifest_path),
+
+        "export_date":
+            endpoint.get("export_date"),
+
+        "manifest_partitions":
+            len(parts),
+
+        "manifest_total_records":
+            endpoint.get("total_records"),
+
+        "manifest_partition_rows":
+            manifest_rows,
+
+        "physical_raw_file_inventory_before_optional_downloads":
+            local,
+
+        "partitions_inspected":
+            len(partition_reports),
+
+        "records_inspected":
+            observed,
+
+        "full_dataset_field_census":
+            full_census,
+
+        "sampling_rule": (
+            "all records per selected partition"
+            if args.full_scan
+            else
+            "first N records per selected partition"
+        ),
+
+        "record_field_counts":
+            dict(aggregate_fields),
+
+        "openfda_field_counts":
+            dict(aggregate_openfda),
+
+        "section_counts":
+            dict(aggregate_sections),
+
+        "product_identifier_counts":
+            dict(aggregate_identifiers),
+
+        "potential_structured_disease_field_names_not_verified":
+            dict(aggregate_candidates),
+
+        "has_verified_structured_indication_disease_mapping":
+            False,
+
+        "scientific_interpretation": (
+            "Human drug label sections contain "
+            "narrative indication text. "
+            "Automatic drug-disease assertions "
+            "require additional text extraction, "
+            "negation/section handling, and "
+            "validated ontology mapping. "
+            "Label presence alone does not "
+            "establish FDA-approved product status."
+        ),
+
+        "partition_inspections":
+            partition_reports,
+    }
+
+    report_file = (
+        inspect
+        / "openfda_field_inspection_report.json"
+    )
+
+    write_json(
+        report,
+        report_file,
+    )
+
+    section(
+        "4. INSPECTION COMPLETE "
+        "(NO DRUG-DISEASE CSV CREATED)"
+    )
+
+    print(
+        "[MANIFEST CSV]",
+        manifest_csv,
+    )
+
+    print(
+        "[FIELD REPORT]",
+        report_file,
+    )
+
+    print(
+        "[RAW ZIP FILES]",
+        raw,
+    )
 
 
 if __name__ == "__main__":

@@ -1,77 +1,27 @@
+
 #!/usr/bin/env python3
+"""Process local repoDB full export into merge-compatible evidence and audited views.
+
+Run: python repoDB.py
+
+No source download. Uses existing:
+    data/raw/repodb/repodb_full_download.tsv
+
+Writes to the existing data/processed/repodb/ files after source validation.
+
+repoDB status is benchmark/development evidence, not an independently verified
+clinical efficacy judgment. repoDB also derives records from AACT and DrugCentral.
 """
-repoDB -> unified drug-disease indication/status CSV
-
-Purpose
--------
-Process repoDB drug repositioning / indication-status records into a
-publication-ready, provenance-aware CSV using the unified multi-source
-drug-disease schema.
-
-Input
------
-Expected local file:
-    /data/ascher02/uqmmune1/ANNOVAR/drug_disease_data/
-    drug-disease-mapping/data/raw/repodb/repodb_full_download.tsv
-
-Source
-------
-repoDB web app:
-    https://unmtid-shinyapps.net/shiny/repodb/
-
-Citation
---------
-Brown AS, Patel CJ.
-A standard database for drug repositioning.
-Scientific Data. 2017;4:170029.
-doi:10.1038/sdata.2017.29
-
-Important interpretation
-------------------------
-repoDB records represent drug repositioning / drug-indication status records.
-Rows include approved, failed, terminated, withdrawn, suspended and other
-status categories. Therefore, do not collapse all repoDB rows into approved
-indications.
-
-For status = approved:
-    relationship_type = indication
-    evidence_type = repodb_approved_indication
-
-For failed/terminated/withdrawn/suspended:
-    relationship_type = failed_or_discontinued_indication
-    evidence_type = repodb_failed_or_discontinued_indication
-
-Unified output columns
-----------------------
-drug_name
-drug_identifier
-drug_identifier_type
-disease_or_condition_name
-disease_or_condition_identifier
-disease_or_condition_identifier_type
-relationship_type
-evidence_type
-source
-internal_source
-
-repoDB-specific metadata columns
---------------------------------
-status
-phase
-nct_id
-detailed_status
-evidence_text
-
-Requirements
-------------
-pip install pandas
-"""
-
 from __future__ import annotations
 
+import argparse
+import csv
 import hashlib
 import json
 import os
+import re
+
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -79,30 +29,35 @@ import pandas as pd
 
 
 # ============================================================
-# CONFIG
+# CONFIGURATION
 # ============================================================
 
-INPUT_FILE = (
-    "/data/ascher02/uqmmune1/ANNOVAR/drug_disease_data/"
-    "drug-disease-mapping/data/raw/repodb/repodb_full_download.tsv"
-)
+ROOT = Path(
+    os.environ.get(
+        "DRUG_DISEASE_ROOT",
+        Path(__file__).resolve().parent,
+    )
+).resolve()
 
-OUTPUT_DIR = (
-    "/data/ascher02/uqmmune1/ANNOVAR/drug_disease_data/"
-    "drug-disease-mapping/data/processed/repodb"
-)
-
-OUTPUT_FILE = os.path.join(OUTPUT_DIR, "repodb_drug_disease.csv")
-DEDUP_FILE = os.path.join(OUTPUT_DIR, "repodb_drug_disease_deduplicated.csv")
-SUMMARY_FILE = os.path.join(OUTPUT_DIR, "repodb_summary.json")
-
+RAW = ROOT / "data/raw/repodb/repodb_full_download.tsv"
+OUT_DIR = ROOT / "data/processed/repodb"
 
 SOURCE_URL = "https://unmtid-shinyapps.net/shiny/repodb/"
-CITATION_DOI = "10.1038/sdata.2017.29"
+DOI = "10.1038/sdata.2017.29"
 
+NA = {"", "na", "n/a", "none", "null", "nan"}
 
-OUTPUT_COLUMNS = [
-    # Unified schema
+REQUIRED = {
+    "drug_name",
+    "drugbank_id",
+    "ind_name",
+    "ind_id",
+    "status",
+    "phase",
+    "NCT",
+}
+
+CORE = [
     "drug_name",
     "drug_identifier",
     "drug_identifier_type",
@@ -113,280 +68,769 @@ OUTPUT_COLUMNS = [
     "evidence_type",
     "source",
     "internal_source",
+]
 
-    # repoDB-specific metadata
+EXTRA = [
     "status",
+    "development_status",
+    "outcome_evidence_class",
     "phase",
     "nct_id",
+    "nct_id_normalised",
     "detailed_status",
+    "detailed_status_normalised",
     "evidence_text",
+    "repodb_source_row_number",
+    "repodb_source_record_json",
+    "repodb_source_line_number",
+    "repodb_name_resolution_drug",
+    "repodb_name_resolution_disease",
+    "repodb_status_normalised",
+    "repodb_nct_ids_extracted_json",
+    "repodb_evidence_granularity",
+]
+
+for entity in ("drug", "disease"):
+    EXTRA.extend(
+        f"{entity}_identifier_{suffix}"
+        for suffix in (
+            "original",
+            "namespace",
+            "canonical",
+            "validation",
+        )
+    )
+
+COLUMNS = CORE + EXTRA
+
+REJECT_COLUMNS = [
+    "repodb_source_row_number",
+    "source_line_number",
+    "reason",
+    "source_record_json",
+]
+
+NAME_AUDIT_COLUMNS = [
+    "repodb_source_row_number",
+    "drug_name_state",
+    "disease_name_state",
+    "drug_identifier_state",
+    "disease_identifier_state",
+    "action",
+]
+
+MALFORMED_COLUMNS = [
+    "data_record_number",
+    "source_line_number",
+    "fields_found",
+    "expected_fields",
+    "record_preview",
 ]
 
 
 # ============================================================
-# HELPERS
+# GENERAL UTILITIES
 # ============================================================
 
-def now_utc() -> str:
+def stamp():
     return datetime.now(timezone.utc).isoformat()
 
 
-def clean_text(x) -> str:
-    if pd.isna(x):
-        return ""
-    return str(x).strip()
+def display(title):
+    print(
+        "\n" + "=" * 88
+        + "\n" + title
+        + "\n" + "=" * 88,
+        flush=True,
+    )
 
 
-def sha256_file(path: str | Path, chunk_size: int = 1024 * 1024) -> str:
-    path = Path(path)
+def sha256(path):
     h = hashlib.sha256()
 
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(chunk_size), b""):
-            h.update(chunk)
+    with Path(path).open("rb") as f:
+        for piece in iter(
+            lambda: f.read(4 * 1024 * 1024),
+            b"",
+        ):
+            h.update(piece)
 
     return h.hexdigest()
 
 
-def human_size(num_bytes: int) -> str:
-    size = float(num_bytes)
-
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if size < 1024:
-            return f"{size:.2f} {unit}"
-        size /= 1024
-
-    return f"{size:.2f} PB"
+def raw_value(x):
+    return "" if x is None else str(x).strip()
 
 
-def detect_separator(file_path: str) -> str:
-    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-        first_line = f.readline()
+def valid_value(x):
+    s = raw_value(x)
 
-    if "\t" in first_line:
-        return "\t"
-
-    return ","
+    return "" if s.casefold() in NA else s
 
 
-def classify_relationship(status: str) -> tuple[str, str]:
+def value_state(x):
+    s = raw_value(x)
+
+    if not s:
+        return "empty"
+
+    if s.casefold() in NA:
+        return "na_literal"
+
+    return "present"
+
+
+# ============================================================
+# REPO DB STATUS CLASSIFICATION
+# ============================================================
+
+def normalise_status(status):
+    s = valid_value(status).casefold()
+
+    s = re.sub(
+        r"[\s/_-]+",
+        "_",
+        s,
+    ).strip("_")
+
+    aliases = {
+        "approve": "approved",
+        "approval": "approved",
+        "approved": "approved",
+
+        "program_terminated": "program_terminated",
+        "trial_halted": "trial_halted",
+
+        "not_approved": "not_approved",
+        "notapprove": "not_approved",
+
+        "terminated": "terminated",
+        "withdrawn": "withdrawn",
+        "suspended": "suspended",
+        "failed": "failed",
+    }
+
+    return aliases.get(
+        s,
+        s or "unspecified",
+    )
+
+
+def classify_status(status):
     """
-    Convert repoDB status into harmonised relationship/evidence labels.
+    Preserve the source classification.
 
-    Important:
-    Do not relabel approved repoDB records as approved_indication.
-    Keep approved status in evidence_type/status metadata.
+    Development discontinuation and repoDB's
+    nonapproved benchmark class must not
+    automatically imply lack of efficacy.
     """
-    status_clean = clean_text(status).lower()
+    s = normalise_status(status)
 
-    if status_clean == "approved":
-        return "indication", "repodb_approved_indication"
+    if s == "approved":
+        return (
+            s,
+            "indication",
+            "repodb_approved_indication",
+            "repoDB_approved",
+        )
 
-    if status_clean in {
-        "failed",
+    if s in {
+        "program_terminated",
+        "trial_halted",
         "terminated",
         "withdrawn",
         "suspended",
     }:
         return (
-            "failed_or_discontinued_indication",
-            "repodb_failed_or_discontinued_indication",
+            s,
+            "discontinued_development",
+            f"repodb_{s}",
+            "development_discontinued_or_halted",
         )
 
-    if status_clean:
-        safe_status = status_clean.replace(" ", "_").replace("/", "_")
+    if s in {
+        "not_approved",
+        "failed",
+    }:
         return (
+            s,
+            "nonapproved_development_record",
+            f"repodb_{s}",
+            "repoDB_nonapproved_benchmark",
+        )
+
+    if s == "unspecified":
+        return (
+            s,
             "drug_indication_with_status",
-            f"repodb_{safe_status}",
+            "repodb_status_unspecified",
+            "status_not_reported",
         )
 
-    return "drug_indication", "repodb_indication_status_unspecified"
-
-
-def normalise_disease_identifier_type(ind_id: str) -> str:
-    """
-    repoDB ind_id values are commonly UMLS CUIs, but keep this defensive.
-    """
-    ind_id = clean_text(ind_id)
-
-    if not ind_id:
-        return ""
-
-    upper = ind_id.upper()
-
-    if upper.startswith("C") and upper[1:].isdigit():
-        return "UMLS"
-
-    if upper.startswith("UMLS:"):
-        return "UMLS"
-
-    if upper.startswith("MESH:"):
-        return "MeSH"
-
-    if upper.startswith("OMIM:"):
-        return "OMIM"
-
-    if upper.startswith("MONDO:"):
-        return "MONDO"
-
-    return "repoDB_IndicationID"
-
-
-def normalise_drug_identifier_type(drugbank_id: str) -> str:
-    drugbank_id = clean_text(drugbank_id)
-
-    if not drugbank_id:
-        return ""
-
-    if drugbank_id.upper().startswith("DB"):
-        return "DrugBank"
-
-    return "repoDB_DrugID"
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def main() -> None:
-    print("=" * 100)
-    print("repoDB PROCESSING")
-    print("=" * 100)
-    print("[SOURCE] repoDB")
-    print(f"[SOURCE URL] {SOURCE_URL}")
-    print(f"[DOI] {CITATION_DOI}")
-    print("[INTERPRETATION] Drug repositioning / indication-status evidence")
-    print("=" * 100)
-
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-    if not os.path.exists(INPUT_FILE):
-        raise FileNotFoundError(
-            f"Input file not found: {INPUT_FILE}\n"
-            "Download repoDB full file first and save it at this path."
-        )
-
-    sep = detect_separator(INPUT_FILE)
-
-    print(f"[INFO] Reading file: {INPUT_FILE}")
-    print(f"[INFO] Detected separator: {repr(sep)}")
-    print(f"[INFO] Input size: {human_size(Path(INPUT_FILE).stat().st_size)}")
-    print(f"[INFO] Input SHA256: {sha256_file(INPUT_FILE)}")
-
-    df = pd.read_csv(
-        INPUT_FILE,
-        sep=sep,
-        dtype=str,
-        keep_default_na=False,
-        low_memory=False,
+    return (
+        s,
+        "drug_indication_with_status",
+        "repodb_status_other",
+        "other_reported_status",
     )
 
-    print(f"[INFO] Rows loaded: {len(df):,}")
-    print(f"[INFO] Columns: {list(df.columns)}")
 
-    required_cols = [
-        "drug_name",
-        "drugbank_id",
-        "ind_name",
-        "ind_id",
-        "NCT",
-        "status",
-        "phase",
+# ============================================================
+# DETAILED STATUS INTERPRETATION
+# ============================================================
+
+REASONS = (
+    (
+        "possible_efficacy_reason",
+        r"\black of (?:clinical )?efficacy\b"
+        r"|\binsufficient efficacy\b"
+        r"|\bfutility\b"
+        r"|\bfailed to meet (?:the )?"
+        r"(?:primary|secondary|efficacy) endpoint\b"
+        r"|\bno clinical benefit\b",
+    ),
+    (
+        "possible_safety_reason",
+        r"\bsafety\b"
+        r"|\badverse event\b"
+        r"|\btoxicit"
+        r"|\btolerab",
+    ),
+    (
+        "possible_operational_reason",
+        r"\brecruit"
+        r"|\benrol"
+        r"|\baccrual\b"
+        r"|\bfund"
+        r"|\bfinancial\b"
+        r"|\bbusiness\b"
+        r"|\bstrateg"
+        r"|\bcommercial\b"
+        r"|\bsponsor\b"
+        r"|\blogistic",
+    ),
+)
+
+
+def outcome_reason(status, detail):
+    """
+    Text-based reason flags are candidates for review,
+    not verified negative clinical outcomes.
+    """
+    if normalise_status(status) == "approved":
+        return "not_applicable_approved"
+
+    text = valid_value(detail).casefold()
+
+    if not text:
+        return "reason_not_reported"
+
+    matches = [
+        label
+        for label, pattern in REASONS
+        if re.search(pattern, text)
     ]
 
-    missing = [c for c in required_cols if c not in df.columns]
+    return (
+        "|".join(matches)
+        if matches
+        else "other_or_unclassified_reason"
+    )
 
-    if missing:
-        raise ValueError(
-            f"Missing required repoDB columns: {missing}\n"
-            f"Available columns: {list(df.columns)}"
+
+# ============================================================
+# IDENTIFIER VALIDATION
+# ============================================================
+
+def identifier(x, entity):
+    """
+    Return:
+       original, namespace, canonical, validation
+
+    Validation is syntactic only. No external
+    cross-database equivalence is inferred.
+    """
+    orig = raw_value(x)
+    token = valid_value(orig).upper()
+
+    if not token:
+        return (
+            orig,
+            "",
+            "",
+            "missing",
         )
 
+    if entity == "drug":
+
+        if re.fullmatch(r"DB\d{5}", token):
+            return (
+                orig,
+                "DrugBank",
+                token,
+                "syntax_valid",
+            )
+
+        return (
+            orig,
+            "unresolved",
+            "",
+            "unrecognised_or_invalid",
+        )
+
+    if re.fullmatch(
+        r"(?:UMLS:)?C\d{7}",
+        token,
+    ):
+        return (
+            orig,
+            "UMLS",
+            "UMLS:" + token.removeprefix("UMLS:"),
+            "syntax_valid",
+        )
+
+    for pat, label, prefix in (
+        (
+            r"MESH:[CD]\d{6,9}",
+            "MeSH",
+            "MESH",
+        ),
+        (
+            r"OMIM:\d{6}",
+            "OMIM",
+            "OMIM",
+        ),
+        (
+            r"DOID:\d+",
+            "DOID",
+            "DOID",
+        ),
+        (
+            r"MONDO:\d{1,7}",
+            "MONDO",
+            "MONDO",
+        ),
+    ):
+
+        if re.fullmatch(pat, token):
+
+            if prefix == "MONDO":
+                token = (
+                    "MONDO:"
+                    + token.split(":")[1].zfill(7)
+                )
+
+            return (
+                orig,
+                label,
+                token,
+                "syntax_valid",
+            )
+
+    return (
+        orig,
+        "unresolved",
+        "",
+        "unrecognised_or_invalid",
+    )
+
+
+# ============================================================
+# INPUT FORMAT VALIDATION
+# ============================================================
+
+def detect_delimiter(path):
+    with path.open(
+        "r",
+        encoding="utf-8-sig",
+        newline="",
+    ) as f:
+        head = f.readline()
+
+    return (
+        "\t"
+        if head.count("\t") >= head.count(",")
+        else ","
+    )
+
+
+def parse_original(path, delimiter):
+    """
+    Strict parser with source record and physical
+    line tracking.
+
+    Malformed records are not silently skipped.
+    """
     rows = []
-    skipped_missing_drug = 0
-    skipped_missing_disease = 0
+    bad = []
 
-    for _, row in df.iterrows():
-        drug_name = clean_text(row["drug_name"])
-        drugbank_id = clean_text(row["drugbank_id"])
+    with path.open(
+        "r",
+        encoding="utf-8-sig",
+        newline="",
+    ) as f:
 
-        disease_name = clean_text(row["ind_name"])
-        disease_id = clean_text(row["ind_id"])
-
-        nct_id = clean_text(row["NCT"])
-        status = clean_text(row["status"])
-        phase = clean_text(row["phase"])
-
-        detailed_status = (
-            clean_text(row["DetailedStatus"])
-            if "DetailedStatus" in df.columns
-            else ""
+        reader = csv.reader(
+            f,
+            delimiter=delimiter,
+            quotechar='"',
+            strict=True,
         )
 
-        if not drug_name:
-            skipped_missing_drug += 1
-            continue
+        header = [
+            c.strip()
+            for c in next(reader)
+        ]
 
-        if not disease_name:
-            skipped_missing_disease += 1
-            continue
+        if (
+            not REQUIRED.issubset(header)
+            or len(header) != len(set(header))
+        ):
+            raise RuntimeError(
+                f"Invalid repoDB header: {header}; "
+                f"missing={sorted(REQUIRED - set(header))}"
+            )
 
-        relationship_type, evidence_type = classify_relationship(status)
+        for number, fields in enumerate(
+            reader,
+            1,
+        ):
 
-        evidence_parts = []
+            if len(fields) != len(header):
 
-        if status:
-            evidence_parts.append(f"status={status}")
+                bad.append({
+                    "data_record_number": number,
+                    "source_line_number": reader.line_num,
+                    "fields_found": len(fields),
+                    "expected_fields": len(header),
+                    "record_preview": str(fields)[:300],
+                })
 
-        if phase:
-            evidence_parts.append(f"phase={phase}")
+                continue
 
-        if nct_id and nct_id.upper() != "NA":
-            evidence_parts.append(f"NCT={nct_id}")
+            rows.append(
+                (
+                    number,
+                    reader.line_num,
+                    dict(zip(header, fields)),
+                )
+            )
 
-        if detailed_status and detailed_status.upper() != "NA":
-            evidence_parts.append(f"DetailedStatus={detailed_status}")
+    return header, rows, bad
 
-        rows.append(
+
+# ============================================================
+# TRANSFORM ONE REPO DB RECORD
+# ============================================================
+
+def make_record(source_number, physical_line, source):
+
+    dn = raw_value(source["drug_name"])
+    di = raw_value(source["drugbank_id"])
+
+    cn = raw_value(source["ind_name"])
+    ci = raw_value(source["ind_id"])
+
+    ds = value_state(dn)
+    cs = value_state(cn)
+
+    did = identifier(di, "drug")
+    cid = identifier(ci, "disease")
+
+    dname = valid_value(dn)
+    cname = valid_value(cn)
+
+    # Preserve missing-name records where an
+    # original identifier is available.
+    #
+    # A placeholder is NOT a verified drug name.
+
+    if not dname and valid_value(di):
+
+        dname = valid_value(di)
+        dname_resolution = "identifier_placeholder"
+
+    else:
+
+        dname_resolution = (
+            "provided_name"
+            if dname
+            else "unresolved"
+        )
+
+    if not cname and valid_value(ci):
+
+        cname = valid_value(ci)
+        cname_resolution = "identifier_placeholder"
+
+    else:
+
+        cname_resolution = (
+            "provided_name"
+            if cname
+            else "unresolved"
+        )
+
+    audit = {
+        "repodb_source_row_number": source_number,
+        "drug_name_state": ds,
+        "disease_name_state": cs,
+        "drug_identifier_state": value_state(di),
+        "disease_identifier_state": value_state(ci),
+        "action": (
+            "retained_with_placeholder"
+            if (
+                not valid_value(dn)
+                or not valid_value(cn)
+            )
+            else "retained"
+        ),
+    }
+
+    # Reject only when there is no usable
+    # name AND no usable identifier.
+
+    if not dname or not cname:
+
+        audit["action"] = (
+            "rejected_no_name_or_identifier"
+        )
+
+        return (
+            None,
+            audit,
             {
-                "drug_name": drug_name,
-                "drug_identifier": drugbank_id,
-                "drug_identifier_type": normalise_drug_identifier_type(
-                    drugbank_id
+                "repodb_source_row_number": source_number,
+                "source_line_number": physical_line,
+                "reason": (
+                    "missing_drug_identity"
+                    if not dname
+                    else "missing_disease_identity"
                 ),
-                "disease_or_condition_name": disease_name,
-                "disease_or_condition_identifier": disease_id,
-                "disease_or_condition_identifier_type": normalise_disease_identifier_type(
-                    disease_id
+                "source_record_json": json.dumps(
+                    source,
+                    ensure_ascii=False,
                 ),
-                "relationship_type": relationship_type,
-                "evidence_type": evidence_type,
-                "source": "repoDB",
-                "internal_source": "repoDB full database",
-                "status": status,
-                "phase": phase,
-                "nct_id": nct_id,
-                "detailed_status": detailed_status,
-                "evidence_text": "; ".join(evidence_parts),
-            }
+            },
         )
 
-    out = pd.DataFrame(rows, columns=OUTPUT_COLUMNS)
+    status = raw_value(source["status"])
+    phase = raw_value(source["phase"])
+    nct = raw_value(source["NCT"])
 
-    print(f"[INFO] Standardised rows: {len(out):,}")
-    print(f"[INFO] Skipped missing drug: {skipped_missing_drug:,}")
-    print(f"[INFO] Skipped missing disease: {skipped_missing_disease:,}")
+    detailed = raw_value(
+        source.get("DetailedStatus", "")
+    )
 
-    if len(out) == 0:
-        raise RuntimeError("No repoDB rows were produced.")
+    (
+        norm_status,
+        relationship,
+        evidence,
+        dev_status,
+    ) = classify_status(status)
 
-    print()
-    print("[OUTPUT PREVIEW]")
-    print(out.head(10).to_string(index=False))
+    # Extract NCT identifiers without turning one
+    # source row into several independent trial
+    # observations.
 
-    out.to_csv(OUTPUT_FILE, index=False)
+    nct_ids = list(dict.fromkeys(
+        x.upper()
+        for x in re.findall(
+            r"\bNCT\d{8}\b",
+            nct,
+            flags=re.I,
+        )
+    ))
 
-    dedup_cols = [
+    normalized_nct = (
+        nct_ids[0]
+        if len(nct_ids) == 1
+        else ""
+    )
+
+    parts = [
+        f"status={status}",
+        f"development_category={dev_status}",
+    ]
+
+    for k, v in (
+        ("phase", phase),
+        ("NCT", nct),
+        ("DetailedStatus", detailed),
+    ):
+        if valid_value(v):
+            parts.append(f"{k}={v}")
+
+    output = dict(
+        drug_name=dname,
+
+        drug_identifier=valid_value(di),
+
+        drug_identifier_type=did[1],
+
+        disease_or_condition_name=cname,
+
+        disease_or_condition_identifier=valid_value(ci),
+
+        disease_or_condition_identifier_type=cid[1],
+
+        relationship_type=relationship,
+
+        evidence_type=evidence,
+
+        source="repoDB",
+
+        internal_source="repoDB full database",
+
+        status=status,
+
+        development_status=dev_status,
+
+        outcome_evidence_class=outcome_reason(
+            status,
+            detailed,
+        ),
+
+        phase=phase,
+
+        nct_id=nct,
+
+        nct_id_normalised=normalized_nct,
+
+        detailed_status=detailed,
+
+        detailed_status_normalised=valid_value(detailed),
+
+        evidence_text="; ".join(parts),
+
+        repodb_source_row_number=str(source_number),
+
+        repodb_source_record_json=json.dumps(
+            source,
+            ensure_ascii=False,
+        ),
+
+        repodb_source_line_number=str(physical_line),
+
+        repodb_name_resolution_drug=dname_resolution,
+
+        repodb_name_resolution_disease=cname_resolution,
+
+        repodb_status_normalised=norm_status,
+
+        repodb_nct_ids_extracted_json=json.dumps(
+            nct_ids
+        ),
+
+        repodb_evidence_granularity=(
+            "repoDB_source_status_record"
+        ),
+    )
+
+    for entity, vals in (
+        ("drug", did),
+        ("disease", cid),
+    ):
+
+        for suffix, val in zip(
+            (
+                "original",
+                "namespace",
+                "canonical",
+                "validation",
+            ),
+            vals,
+        ):
+
+            output[
+                f"{entity}_identifier_{suffix}"
+            ] = val
+
+    return output, audit, None
+
+
+# ============================================================
+# DEDUPLICATION WITH SOURCE PROVENANCE
+# ============================================================
+
+def dedup_with_provenance(full):
+    """
+    Preserve the full source-event CSV unchanged.
+
+    The additional dedup view groups matching
+    assertions while retaining original row links.
+    """
+    keys = [
+        "drug_name",
+        "drug_identifier",
+        "drug_identifier_type",
+        "disease_or_condition_name",
+        "disease_or_condition_identifier",
+        "disease_or_condition_identifier_type",
+        "relationship_type",
+        "evidence_type",
+        "status",
+        "phase",
+        "nct_id",
+        "detailed_status",
+        "outcome_evidence_class",
+    ]
+
+    groups = full.groupby(
+        keys,
+        sort=False,
+        dropna=False,
+    )
+
+    base = (
+        groups.first()
+        .reset_index()[COLUMNS]
+    )
+
+    counts = (
+        groups.size()
+        .rename("repodb_supporting_record_count")
+        .reset_index()
+    )
+
+    links = (
+        groups["repodb_source_row_number"]
+        .agg("|".join)
+        .rename("repodb_supporting_source_rows")
+        .reset_index()
+    )
+
+    dedup = (
+        base.merge(
+            counts,
+            on=keys,
+            validate="one_to_one",
+        )
+        .merge(
+            links,
+            on=keys,
+            validate="one_to_one",
+        )
+    )
+
+    if int(
+        dedup[
+            "repodb_supporting_record_count"
+        ].sum()
+    ) != len(full):
+        raise RuntimeError(
+            "Dedup provenance row accounting failed"
+        )
+
+    return dedup, keys
+
+
+def legacy_duplicate_audit(full):
+    """
+    Show where a broad association-level collapse
+    would have hidden different trials or reasons.
+    """
+    legacy = [
         "drug_name",
         "drug_identifier",
         "disease_or_condition_name",
@@ -397,65 +841,565 @@ def main() -> None:
         "phase",
     ]
 
-    dedup = out.drop_duplicates(subset=dedup_cols)
-    dedup.to_csv(DEDUP_FILE, index=False)
+    items = []
 
-    status_counts = out["status"].value_counts().to_dict()
-    phase_counts = out["phase"].value_counts().to_dict()
-    relationship_type_counts = out["relationship_type"].value_counts().to_dict()
-    evidence_type_counts = out["evidence_type"].value_counts().to_dict()
+    for key, g in full.groupby(
+        legacy,
+        sort=False,
+        dropna=False,
+    ):
 
-    summary = {
-        "timestamp_utc": now_utc(),
-        "source": "repoDB",
-        "source_url": SOURCE_URL,
-        "citation_doi": CITATION_DOI,
-        "interpretation": (
-            "repoDB records represent drug repositioning / indication-status "
-            "evidence. Approved, failed, terminated, withdrawn, suspended and "
-            "other statuses are preserved rather than collapsed into a single "
-            "approved-indication class."
-        ),
-        "input_file": INPUT_FILE,
-        "input_size_bytes": int(Path(INPUT_FILE).stat().st_size),
-        "input_sha256": sha256_file(INPUT_FILE),
-        "rows_loaded": int(len(df)),
-        "rows_written": int(len(out)),
-        "deduplicated_rows_written": int(len(dedup)),
-        "skipped_missing_drug": int(skipped_missing_drug),
-        "skipped_missing_disease": int(skipped_missing_disease),
-        "unique_drugs": int(out["drug_identifier"].nunique()),
-        "unique_drug_names": int(out["drug_name"].nunique()),
-        "unique_diseases": int(out["disease_or_condition_identifier"].nunique()),
-        "unique_disease_names": int(out["disease_or_condition_name"].nunique()),
-        "status_counts": status_counts,
-        "phase_counts": phase_counts,
-        "relationship_type_counts": relationship_type_counts,
-        "evidence_type_counts": evidence_type_counts,
-        "drug_identifier_type_counts": (
-            out["drug_identifier_type"].value_counts().to_dict()
-        ),
-        "disease_identifier_type_counts": (
-            out["disease_or_condition_identifier_type"].value_counts().to_dict()
-        ),
-        "output_file": OUTPUT_FILE,
-        "deduplicated_file": DEDUP_FILE,
-        "output_file_sha256": sha256_file(OUTPUT_FILE),
-        "deduplicated_file_sha256": sha256_file(DEDUP_FILE),
-        "output_columns": OUTPUT_COLUMNS,
-        "deduplication_columns": dedup_cols,
+        if len(g) < 2:
+            continue
+
+        obj = dict(zip(legacy, key))
+
+        obj.update(
+            record_count=len(g),
+
+            source_rows="|".join(
+                g["repodb_source_row_number"]
+            ),
+
+            distinct_nct_count=(
+                g["nct_id"].nunique()
+            ),
+
+            distinct_detailed_status_count=(
+                g["detailed_status"].nunique()
+            ),
+
+            warning=(
+                "distinct trial/reason information"
+                if (
+                    g["nct_id"].nunique() > 1
+                    or g["detailed_status"].nunique() > 1
+                )
+                else "repeated same trial/reason assertion"
+            ),
+        )
+
+        items.append(obj)
+
+    return pd.DataFrame(
+        items,
+        columns=legacy + [
+            "record_count",
+            "source_rows",
+            "distinct_nct_count",
+            "distinct_detailed_status_count",
+            "warning",
+        ],
+    )
+
+
+# ============================================================
+# SAFE OUTPUT STAGING
+# ============================================================
+
+def stage_csv(data, path):
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    tmp = path.with_name(
+        path.name + ".processing.tmp"
+    )
+
+    data.to_csv(
+        tmp,
+        index=False,
+    )
+
+    check = (
+        pd.read_csv(
+            tmp,
+            nrows=0,
+        )
+        .columns.tolist()
+    )
+
+    if check != list(data.columns):
+        raise RuntimeError(
+            "Staged CSV schema failed: " + str(path)
+        )
+
+    return tmp
+
+
+# ============================================================
+# MAIN PROCESSING
+# ============================================================
+
+def run(args):
+
+    inp = args.input.resolve()
+    dest = args.output_dir.resolve()
+
+    if (
+        not inp.is_file()
+        or inp.stat().st_size == 0
+    ):
+        raise FileNotFoundError(
+            f"Existing repoDB raw input missing/empty: {inp}"
+        )
+
+    display(
+        "1. RAW FILE INVENTORY / SOURCE DETAILS"
+    )
+
+    for path in sorted(
+        x for x in inp.parent.rglob("*")
+        if x.is_file()
+    ):
+
+        print(
+            "  ",
+            "USED" if path == inp else "OTHER",
+            path.name,
+            f"{path.stat().st_size:,} bytes",
+        )
+
+    print(
+        "Source:",
+        inp,
+        "SHA256:",
+        sha256(inp),
+    )
+
+    delimiter = detect_delimiter(inp)
+
+    header, rows, malformed = (
+        parse_original(
+            inp,
+            delimiter,
+        )
+    )
+
+    print(
+        "Delimiter:",
+        repr(delimiter),
+        "Header:",
+        " | ".join(header),
+    )
+
+    print(
+        "Parsed data records:",
+        len(rows),
+        "Malformed rows:",
+        len(malformed),
+    )
+
+    if rows:
+        print(
+            "First raw record:",
+            json.dumps(
+                rows[0][2],
+                ensure_ascii=False,
+            )[:1600],
+        )
+
+    if malformed:
+
+        bad_path = (
+            dest / "repodb_malformed_lines.csv"
+        )
+
+        dest.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        pd.DataFrame(
+            malformed,
+            columns=MALFORMED_COLUMNS,
+        ).to_csv(
+            bad_path,
+            index=False,
+        )
+
+        raise RuntimeError(
+            f"Malformed repoDB rows: {len(malformed)}; "
+            f"audit: {bad_path}. "
+            "Existing main outputs unchanged"
+        )
+
+    display(
+        "2. CLASSIFICATION AND SOURCE-TO-MERGE RULES"
+    )
+
+    print(
+        "ONE FILE, NO TABLE JOIN. "
+        "Preserve every repoDB source status event."
+    )
+
+    print(
+        "DrugBank ID and UMLS/other disease ID "
+        "remain original; optional syntax-only "
+        "canonical fields."
+    )
+
+    print(
+        "Approved means repoDB's approved classification, "
+        "not new independent approval verification."
+    )
+
+    print(
+        "Not Approved, Trial Halted, Program Terminated "
+        "are NOT automatically lack of efficacy."
+    )
+
+    print(
+        "Missing names with present IDs use flagged "
+        "ID placeholders; missing both identity "
+        "fields are rejected."
+    )
+
+    print(
+        "Underlying repoDB integrates AACT and DrugCentral: "
+        "overlap must be handled in the final merger."
+    )
+
+    full_rows = []
+    rejects = []
+    name_audit = []
+
+    statuses = Counter()
+
+    for number, line, raw in rows:
+
+        converted, audit, rejected = (
+            make_record(
+                number,
+                line,
+                raw,
+            )
+        )
+
+        statuses[
+            normalise_status(raw["status"])
+        ] += 1
+
+        if audit["action"] != "retained":
+            name_audit.append(audit)
+
+        if rejected is not None:
+            rejects.append(rejected)
+
+        else:
+            full_rows.append(converted)
+
+    full = pd.DataFrame(
+        full_rows,
+        columns=COLUMNS,
+    )
+
+    if (
+        full.empty
+        or len(full) + len(rejects) != len(rows)
+    ):
+        raise RuntimeError(
+            "No valid repoDB output or "
+            "source row conservation failed"
+        )
+
+    dedup, dedup_keys = (
+        dedup_with_provenance(full)
+    )
+
+    audit = legacy_duplicate_audit(full)
+
+    rejected_df = pd.DataFrame(
+        rejects,
+        columns=REJECT_COLUMNS,
+    )
+
+    name_df = pd.DataFrame(
+        name_audit,
+        columns=NAME_AUDIT_COLUMNS,
+    )
+
+    malformed_df = pd.DataFrame(
+        [],
+        columns=MALFORMED_COLUMNS,
+    )
+
+    display(
+        "3. COUNTS, STATUSES, SCHEMA, AND OUTPUT PREVIEW"
+    )
+
+    print(
+        "Source records:",
+        len(rows),
+        "Retained:",
+        len(full),
+        "Rejected:",
+        len(rejects),
+    )
+
+    print(
+        "Deduplicated assertions:",
+        len(dedup),
+        "Repeated evidence:",
+        len(full) - len(dedup),
+    )
+
+    print(
+        "Source status counts:",
+        dict(statuses),
+    )
+
+    print(
+        "Relationship counts:",
+        full[
+            "relationship_type"
+        ].value_counts().to_dict(),
+    )
+
+    print(
+        "Evidence counts:",
+        full[
+            "evidence_type"
+        ].value_counts().to_dict(),
+    )
+
+    print(
+        "Drug name resolution:",
+        full[
+            "repodb_name_resolution_drug"
+        ].value_counts().to_dict(),
+    )
+
+    print(
+        "Disease name resolution:",
+        full[
+            "repodb_name_resolution_disease"
+        ].value_counts().to_dict(),
+    )
+
+    print(
+        "Drug identifier validation:",
+        full[
+            "drug_identifier_validation"
+        ].value_counts().to_dict(),
+    )
+
+    print(
+        "Disease identifier validation:",
+        full[
+            "disease_identifier_validation"
+        ].value_counts().to_dict(),
+    )
+
+    print(
+        "Fields:",
+        " | ".join(COLUMNS),
+    )
+
+    print(
+        "First output row:",
+        json.dumps(
+            full_rows[0],
+            ensure_ascii=False,
+            indent=2,
+        )[:2500],
+    )
+
+    # --------------------------------------------------------
+    # WRITE TO THE SAME ORIGINAL PROCESSED DIRECTORY
+    # --------------------------------------------------------
+
+    output_files = {
+        "repodb_drug_disease.csv": full,
+
+        "repodb_drug_disease_deduplicated.csv":
+            dedup,
+
+        "repodb_duplicate_audit.csv": audit,
+
+        "repodb_name_audit.csv": name_df,
+
+        "repodb_malformed_lines.csv":
+            malformed_df,
+
+        "repodb_rejected_rows.csv":
+            rejected_df,
     }
 
-    with open(SUMMARY_FILE, "w") as f:
-        json.dump(summary, f, indent=2)
+    report = {
+        "status": "success",
+        "timestamp_utc": stamp(),
+        "source": "repoDB",
+        "source_url": SOURCE_URL,
+        "citation_doi": DOI,
 
-    print("=" * 100)
-    print("DONE")
-    print("=" * 100)
-    print(f"[OUTPUT]  {OUTPUT_FILE}")
-    print(f"[DEDUP]   {DEDUP_FILE}")
-    print(f"[SUMMARY] {SUMMARY_FILE}")
-    print("=" * 100)
+        "source_sha256": sha256(inp),
+        "source_file": str(inp),
+        "source_header": header,
+
+        "source_data_rows": len(rows),
+
+        "valid_source_rows": len(full),
+
+        "rejected_identity_rows":
+            len(rejects),
+
+        "deduplicated_assertions":
+            len(dedup),
+
+        "repeated_evidence_rows":
+            len(full) - len(dedup),
+
+        "status_counts":
+            dict(statuses),
+
+        "relationship_type_counts":
+            full["relationship_type"]
+            .value_counts()
+            .to_dict(),
+
+        "evidence_type_counts":
+            full["evidence_type"]
+            .value_counts()
+            .to_dict(),
+
+        "drug_name_lookup_counts":
+            full["repodb_name_resolution_drug"]
+            .value_counts()
+            .to_dict(),
+
+        "disease_name_lookup_counts":
+            full["repodb_name_resolution_disease"]
+            .value_counts()
+            .to_dict(),
+
+        "duplicate_audit_groups":
+            len(audit),
+
+        "missing_name_audit_rows":
+            len(name_df),
+
+        "unique_drug_disease_id_pairs":
+            len(
+                full[
+                    [
+                        "drug_identifier",
+                        "disease_or_condition_identifier",
+                    ]
+                ].drop_duplicates()
+            ),
+
+        "output_columns":
+            COLUMNS,
+
+        "deduplication_keys":
+            dedup_keys,
+
+        "scientific_interpretation": (
+            "Source reported status from repoDB; "
+            "terminated/not-approved/halted does not "
+            "by itself establish lack of efficacy. "
+            "repoDB reuses AACT and DrugCentral evidence."
+        ),
+
+        "record_identity": (
+            "repodb_source_row_number; "
+            "raw record JSON preserved"
+        ),
+
+        "output_files": {
+            name: str(dest / name)
+            for name in output_files
+        },
+    }
+
+    staged = {}
+
+    try:
+
+        for name, frame in output_files.items():
+
+            staged[name] = stage_csv(
+                frame,
+                dest / name,
+            )
+
+        report["output_sha256"] = {
+            name: sha256(temp)
+            for name, temp in staged.items()
+        }
+
+        summary_path = (
+            dest / "repodb_summary.json"
+        )
+
+        summary_tmp = summary_path.with_name(
+            summary_path.name + ".processing.tmp"
+        )
+
+        summary_tmp.write_text(
+            json.dumps(
+                report,
+                indent=2,
+                ensure_ascii=False,
+            ) + "\n",
+            encoding="utf-8",
+        )
+
+        staged[
+            "repodb_summary.json"
+        ] = summary_tmp
+
+        for name, tmp in staged.items():
+
+            tmp.replace(
+                dest / name
+            )
+
+            print(
+                "[OVERWRITTEN]",
+                dest / name,
+            )
+
+    finally:
+
+        for tmp in staged.values():
+            tmp.unlink(
+                missing_ok=True
+            )
+
+    print(
+        "SUCCESS. Merge the full repodb_drug_disease.csv; "
+        "preserve status and NCT evidence."
+    )
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
+def main():
+
+    p = argparse.ArgumentParser(
+        description=__doc__,
+    )
+
+    p.add_argument(
+        "--input",
+        type=Path,
+        default=RAW,
+    )
+
+    p.add_argument(
+        "--output-dir",
+        type=Path,
+        default=OUT_DIR,
+    )
+
+    args = p.parse_args()
+
+    run(args)
 
 
 if __name__ == "__main__":

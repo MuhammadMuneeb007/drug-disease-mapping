@@ -1,130 +1,45 @@
+
 #!/usr/bin/env python3
+"""MEDI-2 original ICD/UMLS files -> merge-compatible medication-indication evidence.
+
+Run: python MEDI.py
+Reuses data/raw/medi/MEDI-2.csv and MEDI-2_UMLS.csv; no network by default.
+Overwrites original data/processed/medi/ outputs, without processed_v2.
+The main CSV contains all eligible source records; dedup view retains support counts.
+MEDI annotations are not evidence of regulatory approval or independent validation.
 """
-MEDI-2 (MEDication-Indication) ensemble resource processing.
-
-Purpose
--------
-Process MEDI-2 ICD-coded and UMLS-coded medication-indication files into
-a publication-ready, provenance-aware CSV using the unified drug-disease
-schema.
-
-Source page:
-    https://www.vumc.org/wei-lab/medi
-
-Input files:
-    MEDI-2.csv
-    MEDI-2_UMLS.csv
-
-Input URLs:
-    https://www.vumc.org/wei-lab/sites/default/files/public_files/MEDI-2.csv
-    https://www.vumc.org/wei-lab/sites/default/files/public_files/MEDI-2_UMLS.csv
-
-Citation:
-    Wei WQ et al. Development and evaluation of an ensemble resource linking
-    medications to their indications. Journal of the American Medical Informatics
-    Association. 2013. doi:10.1136/amiajnl-2012-001431
-
-Licence:
-    CC BY-NC-SA 3.0
-
-Important licence warning
--------------------------
-MEDI is non-commercial and share-alike. Including MEDI-derived rows in a
-redistributed merged dataset may impose non-commercial/share-alike obligations
-on the merged work. If the final dataset is intended to be CC0 or CC BY,
-consider distributing the processing script and metadata only, and let users
-rebuild the MEDI-derived table locally.
-
-Important interpretation
-------------------------
-MEDI records represent medication-indication ensemble evidence. They should
-not be interpreted as regulatory approval evidence unless externally verified.
-
-HIGH_PRECISION_SUBSET is treated as an evidence-quality flag, not a different
-biological relationship type. Therefore:
-    relationship_type = indication
-
-Evidence type is used to distinguish:
-    medi_high_precision_indication
-    medi_ensemble_indication
-
-Unified output columns
-----------------------
-drug_name
-drug_identifier
-drug_identifier_type
-disease_or_condition_name
-disease_or_condition_identifier
-disease_or_condition_identifier_type
-relationship_type
-evidence_type
-source
-internal_source
-
-MEDI-specific metadata columns
-------------------------------
-high_precision_subset
-number_of_resources
-resources_mentioning
-source_record_type
-evidence_text
-
-Requirements
-------------
-pip install pandas
-"""
-
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
+import re
 import urllib.request
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
 
+ROOT = Path(
+    os.environ.get(
+        "DRUG_DISEASE_ROOT",
+        Path(__file__).resolve().parent,
+    )
+).resolve()
 
-# ============================================================
-# CONFIG
-# ============================================================
+RAW = ROOT / "data/raw/medi"
+OUT = ROOT / "data/processed/medi"
 
-MEDI_BASE_URL = "https://www.vumc.org/wei-lab/sites/default/files/public_files"
+URLS = {
+    "MEDI-2.csv":
+        "https://www.vumc.org/wei-lab/sites/default/files/public_files/MEDI-2.csv",
+    "MEDI-2_UMLS.csv":
+        "https://www.vumc.org/wei-lab/sites/default/files/public_files/MEDI-2_UMLS.csv",
+}
 
-MEDI_ICD_URL = f"{MEDI_BASE_URL}/MEDI-2.csv"
-MEDI_UMLS_URL = f"{MEDI_BASE_URL}/MEDI-2_UMLS.csv"
-
-RAW_DIR = (
-    "/data/ascher02/uqmmune1/ANNOVAR/drug_disease_data/"
-    "drug-disease-mapping/data/raw/medi"
-)
-
-OUTPUT_DIR = (
-    "/data/ascher02/uqmmune1/ANNOVAR/drug_disease_data/"
-    "drug-disease-mapping/data/processed/medi"
-)
-
-MEDI_ICD_FILE = os.path.join(RAW_DIR, "MEDI-2.csv")
-MEDI_UMLS_FILE = os.path.join(RAW_DIR, "MEDI-2_UMLS.csv")
-
-OUTPUT_FILE = os.path.join(OUTPUT_DIR, "medi_drug_disease.csv")
-DEDUP_FILE = os.path.join(OUTPUT_DIR, "medi_drug_disease_deduplicated.csv")
-SUMMARY_FILE = os.path.join(OUTPUT_DIR, "medi_summary.json")
-
-
-RESOURCE_FLAG_COLS = [
-    "IN_RXNORM",
-    "IN_MAYO",
-    "IN_MEDLINE",
-    "IN_SIDER",
-    "IN_WEBMD",
-    "IN_WIKIPEDIA",
-]
-
-
-OUTPUT_COLUMNS = [
-    # Unified schema
+CORE = [
     "drug_name",
     "drug_identifier",
     "drug_identifier_type",
@@ -135,407 +50,1328 @@ OUTPUT_COLUMNS = [
     "evidence_type",
     "source",
     "internal_source",
-
-    # MEDI-specific metadata
-    "high_precision_subset",
-    "number_of_resources",
-    "resources_mentioning",
-    "source_record_type",
-    "evidence_text",
 ]
 
+EXTRA = [
+    "high_precision_subset",
+    "high_precision_subset_raw",
+    "number_of_resources",
+    "resources_mentioning",
+    "medi_source_flags",
+    "medi_confidence_tier",
+    "medi_low_confidence_flag",
+    "medi_indication_text_key",
+    "source_record_type",
+    "medi_source_file",
+    "medi_source_row_number",
+    "medi_source_record_json",
+    "evidence_text",
+    "medi_original_vocabulary",
+    "medi_support_count_used",
+    "medi_support_count_basis",
+    "medi_source_semantics",
+]
 
-# ============================================================
-# HELPERS
-# ============================================================
+for entity in ("drug", "disease"):
+    EXTRA += [
+        f"{entity}_identifier_{x}"
+        for x in (
+            "original",
+            "namespace",
+            "canonical",
+            "validation",
+        )
+    ]
 
-def now_utc() -> str:
+COLUMNS = CORE + EXTRA
+
+ICD_REQUIRED = [
+    "RXCUI",
+    "DRUG_DESCRIPTION",
+    "VOCABULARY",
+    "CODE",
+    "INDICATION_DESCRIPTION",
+]
+
+UMLS_REQUIRED = [
+    "RXCUI",
+    "DRUG_DESC",
+    "CUI",
+    "STR",
+]
+
+HPS = "HIGH_PRECISION_SUBSET"
+N_RES = "NUMBER_OF_RESOURCES_MENTIONED"
+
+TRUE = {"TRUE", "T", "1", "YES", "Y"}
+FALSE = {"FALSE", "F", "0", "NO", "N"}
+NULL_TOKENS = {"", "NA", "N/A", "NULL", "NONE", "NAN"}
+
+
+def section(title):
+    print(
+        "\n" + "=" * 90
+        + "\n" + title
+        + "\n" + "=" * 90,
+        flush=True,
+    )
+
+
+def utc():
     return datetime.now(timezone.utc).isoformat()
 
 
-def clean_text(x) -> str:
-    if pd.isna(x):
-        return ""
-    return str(x).strip()
-
-
-def is_truthy(x) -> bool:
-    """
-    MEDI commonly stores booleans as TRUE/FALSE strings.
-    """
-    if pd.isna(x):
-        return False
-
-    s = str(x).strip().upper()
-
-    return s in {"TRUE", "T", "1", "YES", "Y"}
-
-
-def sha256_file(path: str | Path, chunk_size: int = 1024 * 1024) -> str:
-    path = Path(path)
+def checksum(path):
     h = hashlib.sha256()
 
     with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(chunk_size), b""):
-            h.update(chunk)
+        for b in iter(
+            lambda: f.read(4 * 1024 * 1024),
+            b"",
+        ):
+            h.update(b)
 
     return h.hexdigest()
 
 
-def human_size(num_bytes: int) -> str:
-    size = float(num_bytes)
-
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if size < 1024:
-            return f"{size:.2f} {unit}"
-        size /= 1024
-
-    return f"{size:.2f} PB"
+def norm_text(value):
+    return re.sub(
+        r"[^a-z0-9]+",
+        " ",
+        str(value).casefold(),
+    ).strip()
 
 
-def download_if_missing(url: str, path: str, force: bool = False) -> None:
-    path_obj = Path(path)
+def blank(value):
+    return str(value).strip().upper() in NULL_TOKENS
 
-    if path_obj.exists() and path_obj.stat().st_size > 0 and not force:
-        print(f"[CACHE] Already present: {path}")
-        print(f"        Size:   {human_size(path_obj.stat().st_size)}")
-        print(f"        SHA256: {sha256_file(path_obj)}")
+
+def truth(value):
+    s = str(value).strip().upper()
+
+    if s in TRUE:
+        return True
+
+    if s in FALSE:
+        return False
+
+    return None
+
+
+def confidence(value, present):
+    if not present:
+        return (
+            "",
+            "not_reported",
+            "medi_indication_precision_not_reported",
+        )
+
+    result = truth(value)
+
+    if result is True:
+        return (
+            "True",
+            "high_precision",
+            "medi_high_precision_indication",
+        )
+
+    if result is False:
+        return (
+            "False",
+            "ensemble_only",
+            "medi_ensemble_indication",
+        )
+
+    return (
+        "",
+        "not_reported",
+        "medi_indication_precision_not_reported",
+    )
+
+
+def namespace_of(vocab):
+    """
+    Conservative namespace assignment.
+    ICD9 is not assumed to mean ICD9CM.
+    """
+    v = re.sub(
+        r"[ _-]",
+        "",
+        str(vocab).upper(),
+    )
+
+    return {
+        "ICD9CM": "ICD9CM",
+        "ICD10CM": "ICD10CM",
+        "ICD9": "ICD9",
+        "ICD10": "ICD10",
+        "UMLS": "UMLS",
+        "SNOMEDCT": "SNOMEDCT",
+    }.get(v, "unresolved")
+
+
+def id_fields(identifier, ns):
+    """
+    Return original ID, namespace,
+    optional canonical CURIE and validation status.
+
+    Syntax validation does not prove a code is active
+    or establish equivalent ontology concepts.
+    """
+    raw = str(identifier).strip()
+
+    if blank(raw):
+        return "", ns, "", "missing"
+
+    up = raw.upper()
+
+    if ns == "RxNorm":
+        good = bool(re.fullmatch(r"\d+", raw))
+
+        return (
+            raw,
+            ns,
+            f"RXNORM:{raw}" if good else "",
+            "syntax_valid" if good else "invalid_syntax",
+        )
+
+    if ns == "UMLS":
+        good = bool(
+            re.fullmatch(r"C\d{7}", up)
+        )
+
+        return (
+            raw,
+            ns,
+            f"UMLS:{up}" if good else "",
+            "syntax_valid" if good else "invalid_syntax",
+        )
+
+    if ns in {"ICD9CM", "ICD10CM"}:
+        if ns == "ICD9CM":
+            pat = (
+                r"(?:"
+                r"\d{3}(?:\.\d{1,2})?"
+                r"|V\d{2}(?:\.\d{1,2})?"
+                r"|E\d{3}(?:\.\d)?"
+                r")"
+            )
+        else:
+            pat = (
+                r"[A-Z]\d[A-Z0-9]"
+                r"(?:\.[A-Z0-9]{1,4})?"
+            )
+
+        good = bool(re.fullmatch(pat, up))
+
+        return (
+            raw,
+            ns,
+            f"{ns}:{up}" if good else "",
+            "syntax_valid" if good else "invalid_syntax",
+        )
+
+    return raw, ns, "", "unverified_namespace"
+
+
+def write_temp_csv(df, destination):
+    destination.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    temp = destination.with_name(
+        destination.name + ".processing.tmp"
+    )
+
+    df.to_csv(temp, index=False)
+
+    actual = list(
+        pd.read_csv(temp, nrows=0).columns
+    )
+
+    if actual != list(df.columns):
+        raise RuntimeError(
+            f"Unexpected written columns: {temp}"
+        )
+
+    return temp
+
+
+def write_temp_json(content, destination):
+    destination.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    temp = destination.with_name(
+        destination.name + ".processing.tmp"
+    )
+
+    temp.write_text(
+        json.dumps(
+            content,
+            indent=2,
+            ensure_ascii=False,
+            default=str,
+        ) + "\n",
+        encoding="utf-8",
+    )
+
+    return temp
+
+
+def obtain_file(path, url, download_missing):
+    if path.is_file() and path.stat().st_size:
+        print(f"[REUSE] {path}")
         return
 
-    os.makedirs(path_obj.parent, exist_ok=True)
+    if not download_missing:
+        raise FileNotFoundError(
+            f"Missing source file {path}; "
+            "use --download_missing intentionally"
+        )
 
-    print(f"[DOWNLOAD] {url}")
-    urllib.request.urlretrieve(url, path)
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
-    if not path_obj.exists() or path_obj.stat().st_size == 0:
-        raise RuntimeError(f"Downloaded file is missing or empty: {path}")
+    temp = path.with_name(
+        path.name + ".download"
+    )
 
-    print(f"[DOWNLOADED] {path}")
-    print(f"             Size:   {human_size(path_obj.stat().st_size)}")
-    print(f"             SHA256: {sha256_file(path_obj)}")
+    try:
+        urllib.request.urlretrieve(
+            url,
+            temp,
+        )
+
+        if not temp.stat().st_size:
+            raise RuntimeError(
+                f"Empty downloaded source: {url}"
+            )
+
+        temp.replace(path)
+
+    finally:
+        temp.unlink(missing_ok=True)
 
 
-def get_resource_list(row: pd.Series) -> list[str]:
-    """
-    Return list of MEDI resources that mention this drug-indication pair.
-    """
-    resources = []
+def read_source(path, required):
+    df = pd.read_csv(
+        path,
+        dtype=str,
+        keep_default_na=False,
+        encoding="utf-8-sig",
+        on_bad_lines="error",
+    )
 
-    for col in RESOURCE_FLAG_COLS:
-        if col in row.index and is_truthy(row[col]):
-            resources.append(col.replace("IN_", "").lower())
-
-    return resources
-
-
-def validate_columns(df: pd.DataFrame, required_cols: list[str], file_label: str) -> None:
-    missing = [c for c in required_cols if c not in df.columns]
+    missing = sorted(
+        set(required) - set(df.columns)
+    )
 
     if missing:
-        raise ValueError(f"{file_label} missing required columns: {missing}")
+        raise RuntimeError(
+            f"{path.name} missing required columns: "
+            f"{missing}; observed {list(df.columns)}"
+        )
+
+    if df.columns.duplicated().any():
+        raise RuntimeError(
+            f"Duplicate headers in {path.name}"
+        )
+
+    print(
+        f"{path.name}: {len(df):,} source records "
+        f"| {len(df.columns)} fields"
+    )
+
+    print(
+        "FULL HEADER:",
+        " | ".join(df.columns),
+    )
+
+    if len(df):
+        print("FIRST RAW RECORD:")
+
+        for k, v in df.iloc[0].items():
+            print(
+                f"  {k:34} "
+                f"{str(v)[:100]}"
+            )
+
+    return df
 
 
-# ============================================================
-# PROCESSORS
-# ============================================================
+def process_source(df, file_name, mode):
+    section(f"3. PROCESS {file_name}")
 
-def process_medi_icd(file_path: str) -> list[dict]:
-    """
-    Process MEDI-2.csv.
+    configs = {
+        "ICD-coded": (
+            "DRUG_DESCRIPTION",
+            "CODE",
+            "INDICATION_DESCRIPTION",
+            "VOCABULARY",
+        ),
+        "UMLS-coded": (
+            "DRUG_DESC",
+            "CUI",
+            "STR",
+            None,
+        ),
+    }
 
-    This file contains ICD-9-CM / ICD-10-CM coded indications and
-    provenance/resource flags.
-    """
-    print("=" * 100)
-    print("Processing MEDI-2 ICD-coded file")
-    print("=" * 100)
+    drug_col, code_col, disease_col, vocab_col = (
+        configs[mode]
+    )
 
-    df = pd.read_csv(file_path, dtype=str, keep_default_na=False)
-
-    print(f"[INFO] Rows loaded: {len(df):,}")
-    print(f"[INFO] Columns: {list(df.columns)}")
-
-    required_cols = [
-        "RXCUI",
-        "DRUG_DESCRIPTION",
-        "VOCABULARY",
-        "CODE",
-        "INDICATION_DESCRIPTION",
-        "HIGH_PRECISION_SUBSET",
-        "NUMBER_OF_RESOURCES_MENTIONED",
+    support_cols = [
+        c
+        for c in df.columns
+        if c.startswith("IN_")
+        and c not in {HPS, N_RES}
     ]
 
-    validate_columns(df, required_cols, "MEDI-2.csv")
+    print(
+        "SUPPORT FLAGS (kept unaltered):",
+        support_cols,
+    )
+
+    unknown_flags = {
+        c: sorted(
+            set(
+                df[c].str.upper().str.strip()
+            ) - TRUE - FALSE - NULL_TOKENS
+        )[:20]
+        for c in support_cols
+    }
+
+    unknown_flags = {
+        k: v
+        for k, v in unknown_flags.items()
+        if v
+    }
+
+    if unknown_flags:
+        raise RuntimeError(
+            "Unexpected nonboolean source-support "
+            f"flag values in {file_name}: "
+            f"{unknown_flags}"
+        )
+
+    hps_exists = HPS in df.columns
 
     rows = []
-    skipped_missing_drug = 0
-    skipped_missing_disease = 0
+    rejected = []
 
-    for _, row in df.iterrows():
-        rxcui = clean_text(row["RXCUI"])
-        drug_name = clean_text(row["DRUG_DESCRIPTION"])
+    confidence_count = Counter()
+    id_validation = Counter()
 
-        vocabulary = clean_text(row["VOCABULARY"])
-        code = clean_text(row["CODE"])
-        disease_name = clean_text(row["INDICATION_DESCRIPTION"])
+    for source_row_number, record in enumerate(
+        df.to_dict("records"),
+        1,
+    ):
+        drug = str(
+            record[drug_col]
+        ).strip()
 
-        hps = is_truthy(row["HIGH_PRECISION_SUBSET"])
-        n_resources = clean_text(row["NUMBER_OF_RESOURCES_MENTIONED"])
-        resources = get_resource_list(row)
+        rxcui = str(
+            record["RXCUI"]
+        ).strip()
 
-        if not drug_name:
-            skipped_missing_drug += 1
-            continue
+        disease = str(
+            record[disease_col]
+        ).strip()
 
-        if not disease_name:
-            skipped_missing_disease += 1
-            continue
+        code = str(
+            record[code_col]
+        ).strip()
 
-        # Important:
-        # HPS is an evidence-quality flag, not a different relationship type.
-        relationship_type = "indication"
+        vocab = (
+            str(record[vocab_col]).strip()
+            if vocab_col
+            else "UMLS"
+        )
 
-        if hps:
-            evidence_type = "medi_high_precision_indication"
-        else:
-            evidence_type = "medi_ensemble_indication"
-
-        evidence_parts = [
-            f"source_record_type=ICD-coded",
-            f"HIGH_PRECISION_SUBSET={hps}",
-            f"NUMBER_OF_RESOURCES_MENTIONED={n_resources}",
+        missing = [
+            field
+            for field, value in (
+                ("drug_name", drug),
+                ("rxcui", rxcui),
+                ("disease_name", disease),
+                ("disease_code", code),
+            )
+            if blank(value)
         ]
 
-        if resources:
-            evidence_parts.append(f"resources={'|'.join(resources)}")
+        if missing:
+            rejected.append({
+                "source_file": file_name,
+                "source_row_number": source_row_number,
+                "rejection_reason":
+                    "missing:" + "|".join(missing),
+                "original_record_json":
+                    json.dumps(
+                        record,
+                        ensure_ascii=False,
+                    ),
+            })
 
-        rows.append(
-            {
-                "drug_name": drug_name,
-                "drug_identifier": rxcui,
-                "drug_identifier_type": "RxCUI",
-                "disease_or_condition_name": disease_name,
-                "disease_or_condition_identifier": code,
-                "disease_or_condition_identifier_type": vocabulary,
-                "relationship_type": relationship_type,
-                "evidence_type": evidence_type,
-                "source": "MEDI",
-                "internal_source": "MEDI-2 ICD-coded",
-                "high_precision_subset": str(hps),
-                "number_of_resources": n_resources,
-                "resources_mentioning": "|".join(resources),
-                "source_record_type": "ICD-coded",
-                "evidence_text": "; ".join(evidence_parts),
-            }
-        )
-
-    print(f"[INFO] Standardised ICD-coded rows: {len(rows):,}")
-    print(f"[INFO] Skipped missing drug:        {skipped_missing_drug:,}")
-    print(f"[INFO] Skipped missing disease:     {skipped_missing_disease:,}")
-
-    return rows
-
-
-def process_medi_umls(file_path: str) -> list[dict]:
-    """
-    Process MEDI-2_UMLS.csv.
-
-    This file contains UMLS CUI-coded indications and is useful for
-    cross-source disease concept integration.
-    """
-    print("=" * 100)
-    print("Processing MEDI-2 UMLS-coded file")
-    print("=" * 100)
-
-    df = pd.read_csv(file_path, dtype=str, keep_default_na=False)
-
-    print(f"[INFO] Rows loaded: {len(df):,}")
-    print(f"[INFO] Columns: {list(df.columns)}")
-
-    required_cols = [
-        "RXCUI",
-        "DRUG_DESC",
-        "CUI",
-        "STR",
-    ]
-
-    validate_columns(df, required_cols, "MEDI-2_UMLS.csv")
-
-    rows = []
-    skipped_missing_drug = 0
-    skipped_missing_disease = 0
-
-    for _, row in df.iterrows():
-        rxcui = clean_text(row["RXCUI"])
-        drug_name = clean_text(row["DRUG_DESC"])
-
-        umls_cui = clean_text(row["CUI"])
-        disease_name = clean_text(row["STR"])
-
-        if not drug_name:
-            skipped_missing_drug += 1
             continue
 
-        if not disease_name:
-            skipped_missing_disease += 1
-            continue
-
-        rows.append(
-            {
-                "drug_name": drug_name,
-                "drug_identifier": rxcui,
-                "drug_identifier_type": "RxCUI",
-                "disease_or_condition_name": disease_name,
-                "disease_or_condition_identifier": umls_cui,
-                "disease_or_condition_identifier_type": "UMLS",
-                "relationship_type": "indication",
-                "evidence_type": "medi_ensemble_indication",
-                "source": "MEDI",
-                "internal_source": "MEDI-2 UMLS-coded",
-                "high_precision_subset": "",
-                "number_of_resources": "",
-                "resources_mentioning": "",
-                "source_record_type": "UMLS-coded",
-                "evidence_text": "source_record_type=UMLS-coded; source=MEDI-2_UMLS",
-            }
+        raw_hps = (
+            str(
+                record.get(HPS, "")
+            ).strip()
+            if hps_exists
+            else ""
         )
 
-    print(f"[INFO] Standardised UMLS-coded rows: {len(rows):,}")
-    print(f"[INFO] Skipped missing drug:         {skipped_missing_drug:,}")
-    print(f"[INFO] Skipped missing disease:      {skipped_missing_disease:,}")
+        hp, tier, evidence = confidence(
+            raw_hps,
+            hps_exists,
+        )
 
-    return rows
+        ns = namespace_of(vocab)
+
+        drug_id = id_fields(
+            rxcui,
+            "RxNorm",
+        )
+
+        disease_id = id_fields(
+            code,
+            ns,
+        )
+
+        support_true = [
+            flag
+            for flag in support_cols
+            if truth(record[flag]) is True
+        ]
+
+        reported_support = str(
+            record.get(N_RES, "")
+        ).strip()
+
+        if (
+            reported_support
+            and not blank(reported_support)
+        ):
+            if not re.fullmatch(
+                r"\d+",
+                reported_support,
+            ):
+                raise RuntimeError(
+                    f"Noninteger {N_RES} at "
+                    f"{file_name}:{source_row_number}: "
+                    f"{reported_support!r}"
+                )
+
+            support_count = int(
+                reported_support
+            )
+
+            support_basis = N_RES
+
+        elif support_cols:
+            support_count = len(
+                support_true
+            )
+
+            support_basis = "observed_IN_flags"
+
+        else:
+            support_count = None
+
+            support_basis = "not_available"
+
+        low = (
+            tier == "ensemble_only"
+            and support_count is not None
+            and support_count <= 1
+        )
+
+        low_label = (
+            "Unknown"
+            if support_count is None
+            else str(low)
+        )
+
+        flags = "|".join(
+            f"{c}={str(record[c]).strip()}"
+            for c in support_cols
+        )
+
+        out = dict(
+            drug_name=drug,
+            drug_identifier=rxcui,
+            drug_identifier_type="RxCUI",
+            disease_or_condition_name=disease,
+            disease_or_condition_identifier=code,
+            disease_or_condition_identifier_type=ns,
+            relationship_type="indication",
+            evidence_type=evidence,
+            source="MEDI",
+            internal_source=f"MEDI-2 {mode}",
+            high_precision_subset=hp,
+            high_precision_subset_raw=raw_hps,
+            number_of_resources=reported_support,
+            resources_mentioning="|".join(
+                support_true
+            ),
+            medi_source_flags=flags,
+            medi_confidence_tier=tier,
+            medi_low_confidence_flag=low_label,
+            medi_indication_text_key=(
+                f"{rxcui}|{norm_text(disease)}"
+            ),
+            source_record_type=mode,
+            medi_source_file=file_name,
+            medi_source_row_number=str(
+                source_row_number
+            ),
+            medi_source_record_json=json.dumps(
+                record,
+                ensure_ascii=False,
+            ),
+            evidence_text=(
+                f"{mode}; high_precision={tier}; "
+                f"source_support="
+                f"{support_count if support_count is not None else 'unknown'}"
+            ),
+            medi_original_vocabulary=vocab,
+            medi_support_count_used=(
+                ""
+                if support_count is None
+                else str(support_count)
+            ),
+            medi_support_count_basis=support_basis,
+            medi_source_semantics=(
+                "MEDI ensemble medication-indication "
+                "annotation; not regulatory approval"
+            ),
+        )
+
+        for entity, id_data in (
+            ("drug", drug_id),
+            ("disease", disease_id),
+        ):
+            for suffix, value in zip(
+                (
+                    "original",
+                    "namespace",
+                    "canonical",
+                    "validation",
+                ),
+                id_data,
+            ):
+                out[
+                    f"{entity}_identifier_{suffix}"
+                ] = value
+
+        rows.append(out)
+
+        confidence_count[tier] += 1
+
+        id_validation[
+            (ns, disease_id[3])
+        ] += 1
+
+    result = pd.DataFrame(
+        rows,
+        columns=COLUMNS,
+    )
+
+    rejects = pd.DataFrame(
+        rejected,
+        columns=[
+            "source_file",
+            "source_row_number",
+            "rejection_reason",
+            "original_record_json",
+        ],
+    )
+
+    if len(result) + len(rejects) != len(df):
+        raise RuntimeError(
+            f"Conservation failure in {file_name}"
+        )
+
+    print(
+        f"Source rows: {len(df):,} | "
+        f"retained: {len(result):,} | "
+        f"audited rejects: {len(rejects):,}"
+    )
+
+    print(
+        "Precision tiers:",
+        dict(confidence_count),
+    )
+
+    print(
+        "Vocabulary/validation:",
+        {
+            f"{k[0]}:{k[1]}": v
+            for k, v in id_validation.items()
+        },
+    )
+
+    stats = {
+        "input_rows": len(df),
+        "accepted": len(result),
+        "rejected": len(rejects),
+        "original_header": list(df.columns),
+        "resource_flag_columns": support_cols,
+        "precision_tiers":
+            dict(confidence_count),
+    }
+
+    return result, rejects, stats
 
 
-# ============================================================
-# MAIN
-# ============================================================
+def audited_dedup(out):
+    """
+    Retain one assertion per identical metadata key,
+    together with every supporting source-row locator.
 
-def main() -> None:
-    print("=" * 100)
-    print("MEDI-2 PROCESSING")
-    print("=" * 100)
-    print("[SOURCE] MEDI-2 / MEDication-Indication resource")
-    print(f"[ICD URL]  {MEDI_ICD_URL}")
-    print(f"[UMLS URL] {MEDI_UMLS_URL}")
-    print("[DOI] 10.1136/amiajnl-2012-001431")
-    print("[LICENSE] CC BY-NC-SA 3.0")
-    print("[WARNING] Non-commercial and share-alike licence.")
-    print("=" * 100)
-
-    os.makedirs(RAW_DIR, exist_ok=True)
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-    download_if_missing(MEDI_ICD_URL, MEDI_ICD_FILE)
-    download_if_missing(MEDI_UMLS_URL, MEDI_UMLS_FILE)
-
-    icd_rows = process_medi_icd(MEDI_ICD_FILE)
-    umls_rows = process_medi_umls(MEDI_UMLS_FILE)
-
-    out = pd.DataFrame(icd_rows + umls_rows, columns=OUTPUT_COLUMNS)
-
-    print("=" * 100)
-    print("OUTPUT SUMMARY")
-    print("=" * 100)
-    print(f"[INFO] Combined output rows: {len(out):,}")
-
-    if len(out) == 0:
-        raise RuntimeError("No MEDI rows were produced.")
-
-    print()
-    print("[OUTPUT PREVIEW]")
-    print(out.head(10).to_string(index=False))
-
-    out.to_csv(OUTPUT_FILE, index=False)
-
-    dedup_cols = [
-        "drug_name",
+    The full source evidence CSV is never deduplicated.
+    """
+    keys = [
         "drug_identifier",
-        "disease_or_condition_name",
+        "drug_name",
         "disease_or_condition_identifier",
+        "disease_or_condition_identifier_type",
+        "disease_or_condition_name",
         "relationship_type",
         "evidence_type",
         "source_record_type",
+        "high_precision_subset_raw",
+        "number_of_resources",
+        "medi_source_flags",
     ]
 
-    dedup = out.drop_duplicates(subset=dedup_cols)
-    dedup.to_csv(DEDUP_FILE, index=False)
+    annotated = out.copy()
 
-    icd_subset = out[out["source_record_type"] == "ICD-coded"]
-    umls_subset = out[out["source_record_type"] == "UMLS-coded"]
-    hps_subset = out[out["evidence_type"] == "medi_high_precision_indication"]
-
-    relationship_type_counts = out["relationship_type"].value_counts().to_dict()
-    evidence_type_counts = out["evidence_type"].value_counts().to_dict()
-    identifier_type_counts = (
-        out["disease_or_condition_identifier_type"]
-        .value_counts()
-        .to_dict()
+    annotated["_source_locator"] = (
+        annotated["medi_source_file"]
+        + ":"
+        + annotated["medi_source_row_number"]
     )
-    source_record_type_counts = out["source_record_type"].value_counts().to_dict()
 
-    summary = {
-        "timestamp_utc": now_utc(),
-        "source": "MEDI-2",
-        "source_page": "https://www.vumc.org/wei-lab/medi",
-        "icd_url": MEDI_ICD_URL,
-        "umls_url": MEDI_UMLS_URL,
-        "citation_doi": "10.1136/amiajnl-2012-001431",
-        "license": "CC BY-NC-SA 3.0",
-        "license_warning": (
-            "MEDI is non-commercial and share-alike. Inclusion of MEDI-derived "
-            "rows in a redistributed merged dataset may impose NC-SA obligations "
-            "on the merged work."
-        ),
+    grouping = annotated.groupby(
+        keys,
+        dropna=False,
+        sort=False,
+    )
+
+    dedup = grouping.first().reset_index()
+
+    links = (
+        grouping["_source_locator"]
+        .agg("|".join)
+        .rename("medi_supporting_source_rows")
+        .reset_index()
+    )
+
+    counts = (
+        grouping.size()
+        .rename("medi_supporting_record_count")
+        .reset_index()
+    )
+
+    dedup = dedup.merge(
+        links,
+        on=keys,
+        validate="one_to_one",
+    )
+
+    dedup = dedup.merge(
+        counts,
+        on=keys,
+        validate="one_to_one",
+    )
+
+    dedup = dedup.reindex(
+        columns=COLUMNS + [
+            "medi_supporting_record_count",
+            "medi_supporting_source_rows",
+        ]
+    )
+
+    if int(
+        dedup[
+            "medi_supporting_record_count"
+        ].sum()
+    ) != len(out):
+        raise RuntimeError(
+            "Deduplication provenance "
+            "reconciliation failed"
+        )
+
+    return dedup
+
+
+def redundancy_audit(out, crosswalk=None):
+    """
+    Measure lexical cross-code overlap.
+
+    A matching description alone does NOT establish
+    equivalence between ICD and UMLS concepts.
+    """
+    group = out.groupby(
+        "medi_indication_text_key"
+    )["disease_identifier_namespace"].agg(
+        lambda x: sorted(set(x))
+    )
+
+    result = {
+        "same_drug_and_text_groups":
+            len(group),
+
+        "text_groups_with_multiple_coding_namespaces_unverified":
+            int(
+                (group.map(len) > 1).sum()
+            ),
+
         "interpretation": (
-            "MEDI records represent medication-indication ensemble evidence. "
-            "HIGH_PRECISION_SUBSET is treated as an evidence-quality flag, not "
-            "as a separate biological relationship type. Therefore all MEDI "
-            "records use relationship_type=indication, while evidence_type "
-            "distinguishes high-precision and ensemble records."
+            "Text-based overlap is not verified "
+            "concept equivalence and not "
+            "independent evidence"
         ),
-        "icd_file": MEDI_ICD_FILE,
-        "umls_file": MEDI_UMLS_FILE,
-        "icd_file_sha256": sha256_file(MEDI_ICD_FILE),
-        "umls_file_sha256": sha256_file(MEDI_UMLS_FILE),
-        "icd_rows_written": int(len(icd_subset)),
-        "umls_rows_written": int(len(umls_subset)),
-        "high_precision_rows": int(len(hps_subset)),
-        "total_rows_written": int(len(out)),
-        "deduplicated_rows_written": int(len(dedup)),
-        "unique_drugs_rxcui": int(out["drug_identifier"].nunique()),
-        "unique_diseases_combined": int(
-            out[
-                [
-                    "disease_or_condition_identifier_type",
-                    "disease_or_condition_identifier",
-                ]
-            ]
-            .drop_duplicates()
-            .shape[0]
-        ),
-        "source_record_type_counts": source_record_type_counts,
-        "identifier_type_counts": identifier_type_counts,
-        "relationship_type_counts": relationship_type_counts,
-        "evidence_type_counts": evidence_type_counts,
-        "output_file": OUTPUT_FILE,
-        "deduplicated_file": DEDUP_FILE,
-        "output_file_sha256": sha256_file(OUTPUT_FILE),
-        "deduplicated_file_sha256": sha256_file(DEDUP_FILE),
-        "output_columns": OUTPUT_COLUMNS,
-        "deduplication_columns": dedup_cols,
+
+        "crosswalk": "not supplied",
     }
 
-    with open(SUMMARY_FILE, "w") as f:
-        json.dump(summary, f, indent=2)
+    if not crosswalk:
+        return result
 
-    print("=" * 100)
-    print("DONE")
-    print("=" * 100)
-    print(f"[OUTPUT]  {OUTPUT_FILE}")
-    print(f"[DEDUP]   {DEDUP_FILE}")
-    print(f"[SUMMARY] {SUMMARY_FILE}")
-    print("=" * 100)
+    cross = pd.read_csv(
+        crosswalk,
+        dtype=str,
+        keep_default_na=False,
+    )
+
+    required = {
+        "source_curie",
+        "target_curie",
+        "relation",
+        "verified",
+    }
+
+    if not required.issubset(cross.columns):
+        raise RuntimeError(
+            f"Crosswalk needs columns "
+            f"{sorted(required)}"
+        )
+
+    if "entity" in cross.columns:
+        cross = cross.loc[
+            cross["entity"].str.casefold()
+            == "disease"
+        ]
+
+    cross = cross.loc[
+        cross["verified"].str.upper().isin(TRUE)
+        &
+        cross["relation"].str.casefold().isin(
+            {
+                "exact",
+                "equivalent",
+                "exact_match",
+                "skos:exactmatch",
+            }
+        )
+    ]
+
+    cgroup = cross.groupby(
+        "source_curie"
+    )["target_curie"].agg(
+        lambda x: set(x)
+    )
+
+    ambiguous = {
+        key
+        for key, v in cgroup.items()
+        if len(v) != 1
+    }
+
+    trusted = {
+        key: next(iter(v))
+        for key, v in cgroup.items()
+        if len(v) == 1
+    }
+
+    umls = set(
+        zip(
+            out.loc[
+                out["disease_identifier_namespace"]
+                == "UMLS",
+                "drug_identifier",
+            ],
+            out.loc[
+                out["disease_identifier_namespace"]
+                == "UMLS",
+                "disease_identifier_canonical",
+            ],
+        )
+    )
+
+    icd = out.loc[
+        out["disease_identifier_namespace"].isin(
+            {
+                "ICD9CM",
+                "ICD10CM",
+                "ICD9",
+                "ICD10",
+            }
+        )
+    ]
+
+    matching = sum(
+        (drug, trusted.get(source, "")) in umls
+        for drug, source in zip(
+            icd["drug_identifier"],
+            icd["disease_identifier_canonical"],
+        )
+    )
+
+    result["crosswalk"] = {
+        "path": str(crosswalk),
+
+        "sha256": checksum(crosswalk),
+
+        "verified_one_to_one_source_mappings":
+            len(trusted),
+
+        "ambiguous_source_mappings_omitted":
+            len(ambiguous),
+
+        "ICD_rows_with_explicit_exact_UMLS_equivalent_for_same_RxCUI":
+            int(matching),
+
+        "note": (
+            "Audit only: no source records are "
+            "merged or overwritten by crosswalk"
+        ),
+    }
+
+    return result
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+    )
+
+    ap.add_argument(
+        "--raw_dir",
+        default=str(RAW),
+    )
+
+    ap.add_argument(
+        "--output_dir",
+        default=str(OUT),
+    )
+
+    ap.add_argument(
+        "--download_missing",
+        action="store_true",
+    )
+
+    ap.add_argument(
+        "--crosswalk",
+        default="",
+        help=(
+            "Optional reviewed exact-equivalence "
+            "crosswalk (audit only)"
+        ),
+    )
+
+    args = ap.parse_args()
+
+    raw = Path(args.raw_dir).resolve()
+    destination = Path(
+        args.output_dir
+    ).resolve()
+
+    paths = {
+        name: raw / name
+        for name in URLS
+    }
+
+    # ========================================================
+    # 1. RAW FILE INVENTORY
+    # ========================================================
+
+    section("1. SOURCE FILE INVENTORY")
+
+    for name, url in URLS.items():
+        obtain_file(
+            paths[name],
+            url,
+            args.download_missing,
+        )
+
+    inventory = []
+
+    for p in sorted(raw.rglob("*")):
+        if p.is_file():
+            info = {
+                "name": str(
+                    p.relative_to(raw)
+                ),
+                "bytes": p.stat().st_size,
+                "used": (
+                    p.resolve()
+                    in {
+                        x.resolve()
+                        for x in paths.values()
+                    }
+                ),
+            }
+
+            inventory.append(info)
+
+            print(
+                f"  [{'USED' if info['used'] else 'OTHER'}] "
+                f"{info['name']} | "
+                f"{info['bytes']:,} bytes"
+            )
+
+    print(
+        f"Physical raw files: {len(inventory)} "
+        "| required processing files: 2"
+    )
+
+    # ========================================================
+    # 2. ACTUAL INPUT SCHEMAS
+    # ========================================================
+
+    section(
+        "2. INPUT SCHEMAS, ORIGINAL "
+        "HEADERS AND EXAMPLES"
+    )
+
+    icd = read_source(
+        paths["MEDI-2.csv"],
+        ICD_REQUIRED,
+    )
+
+    umls = read_source(
+        paths["MEDI-2_UMLS.csv"],
+        UMLS_REQUIRED,
+    )
+
+    section(
+        "DATA MAPPING / JOIN RULES"
+    )
+
+    print(
+        "No SQL join: ICD-coded and UMLS-coded "
+        "files are transformed separately "
+        "and concatenated vertically."
+    )
+
+    print(
+        "ICD: RXCUI, DRUG_DESCRIPTION, "
+        "VOCABULARY, CODE, "
+        "INDICATION_DESCRIPTION "
+        "-> common fields."
+    )
+
+    print(
+        "UMLS: RXCUI, DRUG_DESC, CUI, STR "
+        "-> common fields."
+    )
+
+    print(
+        "Original vocabulary and source_record_type "
+        "are retained. ICD and UMLS records are "
+        "NOT independent confirmations."
+    )
+
+    print(
+        "HIGH_PRECISION_SUBSET describes confidence, "
+        "not a different biological relationship "
+        "or proof of approval."
+    )
+
+    # ========================================================
+    # 3. PROCESS EACH ORIGINAL FILE
+    # ========================================================
+
+    x, xbad, xstats = process_source(
+        icd,
+        "MEDI-2.csv",
+        "ICD-coded",
+    )
+
+    y, ybad, ystats = process_source(
+        umls,
+        "MEDI-2_UMLS.csv",
+        "UMLS-coded",
+    )
+
+    # ========================================================
+    # 4. COMBINE WITHOUT DISCARDING SOURCE EVIDENCE
+    # ========================================================
+
+    out = pd.concat(
+        [x, y],
+        axis=0,
+        ignore_index=True,
+    ).reindex(columns=COLUMNS)
+
+    rejects = pd.concat(
+        [xbad, ybad],
+        axis=0,
+        ignore_index=True,
+    )
+
+    if (
+        out.empty
+        or len(out) + len(rejects)
+        != len(icd) + len(umls)
+    ):
+        raise RuntimeError(
+            "Combined source conservation failure; "
+            "refusing overwrite"
+        )
+
+    dedup = audited_dedup(out)
+
+    low = out.loc[
+        out["medi_low_confidence_flag"]
+        == "True"
+    ].copy()
+
+    redundancy = redundancy_audit(
+        out,
+        args.crosswalk or None,
+    )
+
+    # ========================================================
+    # 5. HUMAN-READABLE SUMMARY
+    # ========================================================
+
+    section(
+        "4. COUNTS / SCHEMA / RECONCILIATION"
+    )
+
+    print(
+        f"Original ICD + UMLS: "
+        f"{len(icd):,} + {len(umls):,} "
+        f"= {len(icd) + len(umls):,}"
+    )
+
+    print(
+        f"Accepted evidence events: {len(out):,} "
+        f"| audited rejected rows: {len(rejects):,}"
+    )
+
+    print(
+        f"Assertion-level records: {len(dedup):,} "
+        f"| repeated evidence rows: "
+        f"{len(out) - len(dedup):,}"
+    )
+
+    print(
+        f"Low-confidence rows: {len(low):,}"
+    )
+
+    print(
+        "Precision tiers:",
+        out["medi_confidence_tier"]
+        .value_counts()
+        .to_dict(),
+    )
+
+    print(
+        "Disease vocabularies:",
+        out[
+            "disease_or_condition_identifier_type"
+        ]
+        .value_counts()
+        .to_dict(),
+    )
+
+    print(
+        "Cross-system coding redundancy:",
+        redundancy,
+    )
+
+    print(
+        f"Output field count: {len(COLUMNS)}"
+    )
+
+    print(
+        "FULL MERGE SCHEMA:",
+        " | ".join(COLUMNS),
+    )
+
+    print(
+        "FIRST ACCEPTED RECORD:"
+    )
+
+    for key, value in out.iloc[0].items():
+        print(
+            f"  {key:41} "
+            f"{str(value)[:130]}"
+        )
+
+    # ========================================================
+    # 6. WRITE VALIDATED DATA TO SAME DIRECTORY
+    # ========================================================
+
+    section(
+        "5. OVERWRITE OF ORIGINAL "
+        "PROCESSED DIRECTORY"
+    )
+
+    outputs = {
+        "medi_drug_disease.csv": out,
+
+        "medi_drug_disease_deduplicated.csv":
+            dedup,
+
+        "medi_low_confidence_audit.csv":
+            low,
+
+        "medi_rejected_rows.csv":
+            rejects,
+    }
+
+    temps = {}
+
+    try:
+        # Stage and validate every CSV before
+        # replacing the existing processed files.
+        for filename, frame in outputs.items():
+            temps[filename] = write_temp_csv(
+                frame,
+                destination / filename,
+            )
+
+        summary_path = (
+            destination / "medi_summary.json"
+        )
+
+        summary = {
+            "status": "success",
+            "timestamp_utc": utc(),
+            "source": "MEDI-2",
+
+            "interpretation": (
+                "MEDI ensemble medication-indication "
+                "associations; no automatic "
+                "regulatory approval inference"
+            ),
+
+            "licence": (
+                "CC BY-NC-SA 3.0; review original "
+                "terms before redistributing "
+                "derived data"
+            ),
+
+            "source_file_inventory":
+                inventory,
+
+            "input_headers": {
+                "MEDI-2.csv": list(icd.columns),
+                "MEDI-2_UMLS.csv":
+                    list(umls.columns),
+            },
+
+            "original_file_sha256": {
+                name: checksum(path)
+                for name, path in paths.items()
+            },
+
+            "input_rows": {
+                "ICD": len(icd),
+                "UMLS": len(umls),
+            },
+
+            "source_processing": {
+                "ICD": xstats,
+                "UMLS": ystats,
+            },
+
+            "join": (
+                "none; separate source processing, "
+                "then vertical concatenation"
+            ),
+
+            "source_row_identity": (
+                "medi_source_file + "
+                "medi_source_row_number"
+            ),
+
+            "rows_full": len(out),
+            "rows_rejected": len(rejects),
+            "rows_dedup": len(dedup),
+            "rows_low_confidence": len(low),
+
+            "precision_tiers":
+                out["medi_confidence_tier"]
+                .value_counts()
+                .to_dict(),
+
+            "coding_redundancy":
+                redundancy,
+
+            "output_columns":
+                COLUMNS,
+
+            "output_files": {
+                name: str(destination / name)
+                for name in outputs
+            },
+
+            "output_file_sha256": {
+                name: checksum(tmp)
+                for name, tmp in temps.items()
+            },
+
+            "licence_note": (
+                "Data are subject to MEDI "
+                "redistribution limitations; "
+                "distributing only scripts "
+                "may be preferable"
+            ),
+        }
+
+        summary_tmp = write_temp_json(
+            summary,
+            summary_path,
+        )
+
+        temps["medi_summary.json"] = (
+            summary_tmp
+        )
+
+        # Replace the current processed files.
+        for filename, tmp in temps.items():
+            tmp.replace(
+                destination / filename
+            )
+
+            print(
+                "[OVERWRITTEN]",
+                destination / filename,
+            )
+
+        print(
+            "SUCCESS. Use medi_drug_disease.csv "
+            "(full source evidence) in the "
+            "updated central merger."
+        )
+
+    finally:
+        for tmp in temps.values():
+            tmp.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

@@ -1,91 +1,106 @@
+
 #!/usr/bin/env python3
+"""Broad Drug Repurposing Hub -> merge-compatible drug/disease CSV.
+
+Reuses data/raw/broad_repurposing/repurposing_drugs_20200324.txt
+and overwrites existing outputs in data/processed/broad_repurposing.
+
+Does not silently download missing data.
+
+The source annotation is not proof of regulatory approval
+or treatment efficacy.
 """
-Broad Drug Repurposing Hub – drug-disease processing.
+from __future__ import annotations
 
-Source page:       https://repo-hub.broadinstitute.org/repurposing
-Drug info file:    repurposing_drugs_20200324.txt
-Citation:          Corsello SM et al. Nature Medicine. 2017;23(4):405-408.
-                   doi:10.1038/nm.4306
-
-LICENCE:
-    The Broad Drug Repurposing Hub data is provided for non-commercial use only.
-
-IMPORTANT:
-    Including Broad-derived rows in a redistributed merged dataset may impose
-    non-commercial restrictions on the merged work. If the final Zenodo release
-    is intended to be fully open/reusable, consider distributing the script and
-    summary only, not the Broad-derived CSV itself.
-
-File format:
-    - Metadata lines start with "!"
-    - First non-"!" line is the real header
-    - Expected columns:
-        pert_iname
-        clinical_phase
-        moa
-        target
-        disease_area
-        indication
-
-Processing logic:
-    - drug_name comes from pert_iname
-    - disease_or_condition_name comes from indication
-    - indication may contain multiple values separated by "|"
-    - indication is expanded into one drug-disease row per indication
-    - disease_area/category is NOT expanded
-    - disease_area is preserved as metadata exactly as provided
-    - clinical_phase is preserved as metadata only
-    - relationship_type is kept as "drug_indication"
-    - evidence_type is kept as "broad_repurposing_hub"
-"""
-
-import os
-import json
+import argparse
+import csv
 import hashlib
+import json
+import os
+import re
+import tempfile
 import urllib.request
+from collections import Counter
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pandas as pd
 
 
 # ============================================================
-# CONFIG
+# CONFIGURATION
 # ============================================================
 
-BROAD_DRUG_URL = (
-    "https://s3.amazonaws.com/data.clue.io/repurposing/downloads/"
-    "repurposing_drugs_20200324.txt"
-)
+ROOT = Path(
+    os.environ.get(
+        "DRUG_DISEASE_ROOT",
+        Path(__file__).resolve().parent,
+    )
+).resolve()
 
-RAW_DIR = (
-    "/data/ascher02/uqmmune1/ANNOVAR/drug_disease_data/"
-    "drug-disease-mapping/data/raw/broad_repurposing"
-)
+RAW_DIR = ROOT / "data" / "raw" / "broad_repurposing"
 
 OUTPUT_DIR = (
-    "/data/ascher02/uqmmune1/ANNOVAR/drug_disease_data/"
-    "drug-disease-mapping/data/processed/broad_repurposing"
+    ROOT / "data" / "processed" / "broad_repurposing"
 )
 
-DRUG_FILE = os.path.join(RAW_DIR, "repurposing_drugs_20200324.txt")
+RAW_NAME = "repurposing_drugs_20200324.txt"
 
-OUTPUT_FILE = os.path.join(
-    OUTPUT_DIR,
-    "broad_repurposing_drug_disease.csv",
+SOURCE_URL = (
+    "https://s3.amazonaws.com/data.clue.io/"
+    "repurposing/downloads/" + RAW_NAME
 )
 
-DEDUP_FILE = os.path.join(
-    OUTPUT_DIR,
-    "broad_repurposing_drug_disease_deduplicated.csv",
+SOURCE_NAME = "Broad Drug Repurposing Hub"
+
+INTERNAL_SOURCE = (
+    "Broad Repurposing Hub drug annotation file"
 )
 
-SUMMARY_FILE = os.path.join(
-    OUTPUT_DIR,
-    "broad_repurposing_summary.json",
-)
+REQUIRED = [
+    "pert_iname",
+    "clinical_phase",
+    "moa",
+    "target",
+    "disease_area",
+    "indication",
+]
 
+CORE = [
+    "drug_name",
+    "drug_identifier",
+    "drug_identifier_type",
+    "disease_or_condition_name",
+    "disease_or_condition_identifier",
+    "disease_or_condition_identifier_type",
+    "relationship_type",
+    "evidence_type",
+    "source",
+    "internal_source",
+]
 
-STANDARD_COLUMNS = [
+EXTRA = [
+    "clinical_phase",
+    "disease_area",
+    "moa",
+    "target",
+    "original_indication_field",
+    "evidence_text",
+    "broad_source_row_number",
+    "indication_index",
+    "n_indications_in_field",
+]
+
+COLUMNS = CORE + EXTRA
+
+# Deduplicate identical assertions and annotations.
+# Keep different targets, mechanisms and disease areas
+# as distinct evidence records.
+#
+# The original row numbers are not part of the key.
+# They are aggregated as supporting provenance.
+
+ASSERTION_KEY = [
     "drug_name",
     "drug_identifier",
     "drug_identifier_type",
@@ -106,116 +121,611 @@ STANDARD_COLUMNS = [
 
 
 # ============================================================
-# HELPERS
+# UTILITIES
 # ============================================================
 
-def clean_text(x) -> str:
-    """Convert missing values to empty string and strip whitespace."""
-    if pd.isna(x):
-        return ""
-    return str(x).strip()
+def timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
-def normalise_space(x) -> str:
-    """Collapse repeated whitespace."""
-    x = clean_text(x)
-    return " ".join(x.split())
-
-
-def split_indications(indication: str) -> list[str]:
-    """
-    Split Broad indication field into disease/condition terms.
-
-    Example:
-        headache|fever|toothache
-
-    becomes:
-        ["headache", "fever", "toothache"]
-    """
-    indication = clean_text(indication)
-
-    if not indication:
-        return []
-
-    return [
-        normalise_space(x)
-        for x in indication.split("|")
-        if normalise_space(x)
-    ]
-
-
-def sha256_file(path: str) -> str:
-    """Return SHA256 checksum for a file."""
+def sha256(path: Path) -> str:
     h = hashlib.sha256()
 
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+    with path.open("rb") as f:
+        for chunk in iter(
+            lambda: f.read(4 * 1024 * 1024),
+            b"",
+        ):
             h.update(chunk)
 
     return h.hexdigest()
 
 
-def download_if_missing(url: str, path: str) -> None:
-    """Download file if missing or empty."""
-    if os.path.exists(path) and os.path.getsize(path) > 0:
-        print(f"[INFO] Already present: {path}")
+def normalise_space(value: str) -> str:
+    return " ".join(str(value).split())
+
+
+def heading(message: str) -> None:
+    print("\n" + "=" * 94)
+    print(message)
+    print("=" * 94)
+
+
+def atomic_csv(df: pd.DataFrame, dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        newline="",
+        suffix=".tmp",
+        prefix=dest.name + ".",
+        dir=dest.parent,
+        delete=False,
+    ) as f:
+        tmp = Path(f.name)
+
+    try:
+        df.to_csv(tmp, index=False)
+        os.replace(tmp, dest)
+
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def atomic_json(data: dict, dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        newline="",
+        suffix=".tmp",
+        prefix=dest.name + ".",
+        dir=dest.parent,
+        delete=False,
+    ) as f:
+        tmp = Path(f.name)
+
+    try:
+        tmp.write_text(
+            json.dumps(
+                data,
+                indent=2,
+                ensure_ascii=False,
+                default=str,
+            ) + "\n",
+            encoding="utf-8",
+        )
+
+        os.replace(tmp, dest)
+
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+# ============================================================
+# RAW FILE HANDLING
+# ============================================================
+
+def obtain_raw(
+    path: Path,
+    allow_download: bool,
+) -> None:
+
+    if path.is_file() and path.stat().st_size > 0:
+        print(f"[REUSE EXISTING RAW FILE] {path}")
         return
 
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if not allow_download:
+        raise FileNotFoundError(
+            f"Pinned raw input missing: {path}. "
+            "No download was attempted. "
+            "Use --download_missing only if you intend "
+            "to download this snapshot."
+        )
 
-    print(f"[INFO] Downloading: {url}")
-    urllib.request.urlretrieve(url, path)
-
-    size_kb = os.path.getsize(path) / 1024
-    print(f"[INFO] Saved to: {path} ({size_kb:.1f} KB)")
-
-
-def read_broad_file(file_path: str) -> pd.DataFrame:
-    """
-    Read Broad Hub TSV, skipping metadata lines beginning with '!'.
-    """
-    skip = 0
-
-    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            if line.startswith("!"):
-                skip += 1
-            else:
-                break
-
-    print(f"[INFO] Skipping {skip} metadata lines beginning with '!'")
-
-    df = pd.read_csv(
-        file_path,
-        sep="\t",
-        skiprows=skip,
-        dtype=str,
-        keep_default_na=False,
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
     )
 
-    df.columns = [clean_text(c) for c in df.columns]
+    tmp = path.with_name(
+        path.name + ".download"
+    )
 
-    return df
+    try:
+        print(
+            f"[DOWNLOADING PINNED SOURCE] {SOURCE_URL}"
+        )
+
+        urllib.request.urlretrieve(
+            SOURCE_URL,
+            tmp,
+        )
+
+        if tmp.stat().st_size == 0:
+            raise RuntimeError(
+                "Downloaded input is empty"
+            )
+
+        os.replace(tmp, path)
+
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
-def validate_required_columns(df: pd.DataFrame) -> None:
-    """Validate that required Broad columns exist."""
-    required_cols = [
-        "pert_iname",
-        "clinical_phase",
-        "moa",
-        "target",
-        "disease_area",
-        "indication",
+def inspect_directory(
+    raw: Path,
+    used: Path,
+) -> list[dict]:
+
+    heading("1. DOWNLOADED FILE INVENTORY")
+
+    entries = []
+
+    for path in sorted(
+        p for p in raw.rglob("*") if p.is_file()
+    ):
+        rel = str(
+            path.relative_to(raw)
+        )
+
+        active = (
+            path.resolve() == used.resolve()
+        )
+
+        item = {
+            "name": rel,
+            "size_bytes": path.stat().st_size,
+            "used_for_processing": active,
+        }
+
+        entries.append(item)
+
+        print(
+            f"  [{'INPUT' if active else 'OTHER':5}] "
+            f"{rel} | "
+            f"{item['size_bytes']:,} bytes"
+        )
+
+    print(
+        f"Physical raw files: {len(entries):,}; "
+        "files used in this processor: 1"
+    )
+
+    if not any(
+        x["used_for_processing"]
+        for x in entries
+    ):
+        raise RuntimeError(
+            "Processing input does not appear in "
+            "the raw-directory inventory"
+        )
+
+    return entries
+
+
+# ============================================================
+# STRICT SOURCE READER
+# ============================================================
+
+def read_broad(
+    path: Path,
+) -> tuple[list[str], list[dict], int]:
+    """
+    Strict tab-delimited CSV reader.
+
+    Handles:
+      - leading ! metadata lines
+      - quoted tabs
+      - quoted newlines
+      - commas inside indication names
+      - string identifiers
+      - malformed record detection
+    """
+
+    with path.open(
+        "r",
+        encoding="utf-8-sig",
+        newline="",
+    ) as f:
+
+        metadata_lines = 0
+
+        while True:
+            offset = f.tell()
+            line = f.readline()
+
+            if not line:
+                raise RuntimeError(
+                    "Broad input has no tabular header"
+                )
+
+            if (
+                line.startswith("!")
+                or not line.strip()
+            ):
+                metadata_lines += 1
+                continue
+
+            f.seek(offset)
+            break
+
+        reader = csv.reader(
+            f,
+            delimiter="\t",
+            quotechar='"',
+            strict=True,
+        )
+
+        header = [
+            x.strip()
+            for x in next(reader)
+        ]
+
+        if len(header) != len(set(header)):
+            raise RuntimeError(
+                "Duplicate column names in Broad header"
+            )
+
+        missing = sorted(
+            set(REQUIRED) - set(header)
+        )
+
+        if missing:
+            raise RuntimeError(
+                f"Required columns missing: {missing}; "
+                f"actual={header}"
+            )
+
+        rows = []
+
+        for record_number, fields in enumerate(
+            reader,
+            start=1,
+        ):
+
+            if len(fields) != len(header):
+                raise RuntimeError(
+                    f"Broad raw record {record_number}: "
+                    f"{len(fields)} fields, "
+                    f"expected {len(header)}. "
+                    "Check delimiter/quoting."
+                )
+
+            rows.append(
+                {
+                    "broad_source_row_number":
+                        record_number,
+                    **dict(zip(header, fields)),
+                }
+            )
+
+    return header, rows, metadata_lines
+
+
+# ============================================================
+# INDICATION EXPANSION
+# ============================================================
+
+def split_indications(
+    value: str,
+) -> tuple[list[str], int, int]:
+
+    raw_segments = str(value).split("|")
+
+    clean_segments = [
+        normalise_space(v)
+        for v in raw_segments
     ]
 
-    missing = [c for c in required_cols if c not in df.columns]
+    terms = [
+        v for v in clean_segments
+        if v
+    ]
 
-    if missing:
-        raise ValueError(
-            "Broad drug file is missing required columns: "
-            + ", ".join(missing)
+    empty = sum(
+        not bool(v)
+        for v in clean_segments
+    )
+
+    repeated = (
+        len(terms)
+        - len({
+            v.casefold()
+            for v in terms
+        })
+    )
+
+    return terms, empty, repeated
+
+
+# ============================================================
+# SOURCE-LEVEL PROCESSING
+# ============================================================
+
+def process_records(
+    raw_records: list[dict],
+) -> tuple[pd.DataFrame, dict]:
+
+    out = []
+
+    missing_drug = 0
+    missing_indication = 0
+
+    missing_by_phase = Counter()
+
+    empty_segments = 0
+    repeated_terms = 0
+
+    rows_with_multiple_indications = 0
+    added_by_expansion = 0
+    raw_rows_accepted = 0
+
+    for row in raw_records:
+
+        drug = normalise_space(
+            row["pert_iname"]
         )
+
+        phase = normalise_space(
+            row["clinical_phase"]
+        )
+
+        if not drug:
+            missing_drug += 1
+            continue
+
+        # Preserve the original field exactly.
+        original = row["indication"]
+
+        indications, n_empty, n_repeat = (
+            split_indications(original)
+        )
+
+        empty_segments += n_empty
+        repeated_terms += n_repeat
+
+        if not indications:
+            missing_indication += 1
+
+            missing_by_phase[
+                phase or "Missing"
+            ] += 1
+
+            continue
+
+        raw_rows_accepted += 1
+
+        if len(indications) > 1:
+            rows_with_multiple_indications += 1
+
+            added_by_expansion += (
+                len(indications) - 1
+            )
+
+        area = normalise_space(
+            row["disease_area"]
+        )
+
+        moa = normalise_space(
+            row["moa"]
+        )
+
+        targets = normalise_space(
+            row["target"]
+        )
+
+        evidence_parts = [
+            f"{key}={value}"
+            for key, value in (
+                ("clinical_phase", phase),
+                ("disease_area", area),
+                ("moa", moa),
+                ("target", targets),
+            )
+            if value
+        ]
+
+        evidence_text = "; ".join(
+            evidence_parts
+        )
+
+        for index, disease in enumerate(
+            indications,
+            start=1,
+        ):
+
+            out.append(
+                {
+                    "drug_name": drug,
+                    "drug_identifier": "",
+                    "drug_identifier_type": "",
+
+                    "disease_or_condition_name":
+                        disease,
+
+                    "disease_or_condition_identifier":
+                        "",
+
+                    "disease_or_condition_identifier_type":
+                        "",
+
+                    "relationship_type":
+                        "drug_indication",
+
+                    "evidence_type":
+                        "broad_repurposing_hub",
+
+                    "source": SOURCE_NAME,
+
+                    "internal_source":
+                        INTERNAL_SOURCE,
+
+                    "clinical_phase": phase,
+
+                    "disease_area": area,
+
+                    "moa": moa,
+
+                    "target": targets,
+
+                    "original_indication_field":
+                        original,
+
+                    "evidence_text": evidence_text,
+
+                    "broad_source_row_number":
+                        str(
+                            row["broad_source_row_number"]
+                        ),
+
+                    "indication_index":
+                        str(index),
+
+                    "n_indications_in_field":
+                        str(len(indications)),
+                }
+            )
+
+    if not out:
+        raise RuntimeError(
+            "No eligible drug-indication records "
+            "generated. Refusing to overwrite outputs."
+        )
+
+    df = pd.DataFrame.from_records(
+        out,
+        columns=COLUMNS,
+    ).fillna("")
+
+    if len(df) != (
+        raw_rows_accepted
+        + added_by_expansion
+    ):
+        raise RuntimeError(
+            "Indication expansion accounting error"
+        )
+
+    if len(raw_records) != (
+        raw_rows_accepted
+        + missing_drug
+        + missing_indication
+    ):
+        raise RuntimeError(
+            "Raw input row accounting error"
+        )
+
+    summary = {
+        "rows_in_source_file":
+            len(raw_records),
+
+        "rows_skipped_no_drug":
+            missing_drug,
+
+        "rows_skipped_no_indication":
+            missing_indication,
+
+        "raw_rows_accepted":
+            raw_rows_accepted,
+
+        "rows_with_multiple_indications":
+            rows_with_multiple_indications,
+
+        "additional_rows_from_indication_expansion":
+            added_by_expansion,
+
+        "expanded_rows_from_multi_indication":
+            (
+                added_by_expansion
+                + rows_with_multiple_indications
+            ),
+
+        "empty_pipe_segments":
+            empty_segments,
+
+        "repeated_terms_within_field":
+            repeated_terms,
+
+        "rows_missing_indication_by_clinical_phase":
+            dict(missing_by_phase),
+
+        "rows_written":
+            len(df),
+    }
+
+    return df, summary
+
+
+# ============================================================
+# PROVENANCE-AWARE DEDUPLICATION
+# ============================================================
+
+def deduplicate_preserving_support(
+    df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Collapse identical assertion/annotation rows,
+    retaining links to all supporting source rows.
+
+    Differing phases, mechanisms, targets, disease
+    areas and original indication fields remain distinct.
+    """
+
+    groups: dict[tuple, dict] = {}
+
+    for item in df.to_dict(orient="records"):
+
+        key = tuple(
+            item[col]
+            for col in ASSERTION_KEY
+        )
+
+        if key not in groups:
+            groups[key] = {
+                **item,
+                "broad_supporting_record_count":
+                    0,
+                "broad_supporting_source_records":
+                    [],
+            }
+
+        entry = groups[key]
+
+        entry[
+            "broad_supporting_record_count"
+        ] += 1
+
+        entry[
+            "broad_supporting_source_records"
+        ].append(
+            item["broad_source_row_number"]
+            + ":"
+            + item["indication_index"]
+        )
+
+    rows = []
+
+    for item in groups.values():
+
+        item[
+            "broad_supporting_source_records"
+        ] = "|".join(
+            item[
+                "broad_supporting_source_records"
+            ]
+        )
+
+        rows.append(item)
+
+    return pd.DataFrame(
+        rows,
+        columns=COLUMNS + [
+            "broad_supporting_record_count",
+            "broad_supporting_source_records",
+        ],
+    )
 
 
 # ============================================================
@@ -223,215 +733,403 @@ def validate_required_columns(df: pd.DataFrame) -> None:
 # ============================================================
 
 def main() -> None:
-    print("=" * 100)
-    print("BROAD DRUG REPURPOSING HUB PROCESSING")
-    print("=" * 100)
-    print("[SOURCE]  Broad Drug Repurposing Hub")
-    print("[INPUT]   repurposing_drugs_20200324.txt")
-    print("[LICENCE] Non-commercial use only")
-    print("[NOTE]    indication is expanded into one drug-disease row per indication.")
-    print("[NOTE]    disease_area/category is preserved as metadata and is NOT expanded.")
-    print("[NOTE]    clinical_phase is preserved as metadata and is NOT reclassified.")
-    print("=" * 100)
 
-    os.makedirs(RAW_DIR, exist_ok=True)
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-    download_if_missing(BROAD_DRUG_URL, DRUG_FILE)
-
-    file_size = os.path.getsize(DRUG_FILE)
-    file_sha256 = sha256_file(DRUG_FILE)
-
-    print(f"[INFO] Input file size: {file_size:,} bytes")
-    print(f"[INFO] Input SHA256:   {file_sha256}")
-
-    df = read_broad_file(DRUG_FILE)
-
-    print(f"[INFO] Rows loaded from Broad file: {len(df):,}")
-    print(f"[INFO] Columns: {list(df.columns)}")
-
-    validate_required_columns(df)
-
-    rows = []
-
-    skipped_no_drug = 0
-    skipped_no_indication = 0
-    expanded_rows_from_multi_indication = 0
-
-    for _, row in df.iterrows():
-        drug_name = normalise_space(row["pert_iname"])
-        clinical_phase = normalise_space(row["clinical_phase"])
-        moa = normalise_space(row["moa"])
-        target = normalise_space(row["target"])
-        disease_area = normalise_space(row["disease_area"])
-        indication = normalise_space(row["indication"])
-
-        if not drug_name:
-            skipped_no_drug += 1
-            continue
-
-        if not indication:
-            skipped_no_indication += 1
-            continue
-
-        indications = split_indications(indication)
-
-        if not indications:
-            skipped_no_indication += 1
-            continue
-
-        if len(indications) > 1:
-            expanded_rows_from_multi_indication += len(indications)
-
-        # IMPORTANT:
-        # Keep original Broad interpretation.
-        # Do NOT reclassify clinical_phase into approved/clinical/preclinical/withdrawn.
-        relationship_type = "drug_indication"
-        evidence_type = "broad_repurposing_hub"
-
-        for disease_name in indications:
-            evidence_parts = []
-
-            if clinical_phase:
-                evidence_parts.append(f"clinical_phase={clinical_phase}")
-
-            if disease_area:
-                evidence_parts.append(f"disease_area={disease_area}")
-
-            if moa:
-                evidence_parts.append(f"moa={moa}")
-
-            if target:
-                evidence_parts.append(f"target={target}")
-
-            rows.append(
-                {
-                    "drug_name": drug_name,
-                    "drug_identifier": "",
-                    "drug_identifier_type": "",
-                    "disease_or_condition_name": disease_name,
-                    "disease_or_condition_identifier": "",
-                    "disease_or_condition_identifier_type": "",
-                    "relationship_type": relationship_type,
-                    "evidence_type": evidence_type,
-                    "source": "Broad Drug Repurposing Hub",
-                    "internal_source": "Broad Repurposing Hub drug annotation file",
-                    "clinical_phase": clinical_phase,
-                    "disease_area": disease_area,
-                    "moa": moa,
-                    "target": target,
-                    "original_indication_field": indication,
-                    "evidence_text": "; ".join(evidence_parts),
-                }
-            )
-
-    out = pd.DataFrame(rows, columns=STANDARD_COLUMNS)
-
-    print("=" * 100)
-    print("[PROCESSING SUMMARY]")
-    print(f"[INFO] Rows in source file:                         {len(df):,}")
-    print(f"[INFO] Rows skipped, missing drug:                 {skipped_no_drug:,}")
-    print(f"[INFO] Rows skipped, missing indication:           {skipped_no_indication:,}")
-    print(f"[INFO] Standardised output rows:                   {len(out):,}")
-    print(
-        f"[INFO] Expanded rows from multi-indication fields: "
-        f"{expanded_rows_from_multi_indication:,}"
+    parser = argparse.ArgumentParser(
+        description=__doc__,
     )
 
-    if len(out) == 0:
-        print("[WARN] No output rows generated.")
-    else:
-        print()
-        print("[EXAMPLE OUTPUT ROWS]")
-        print(out.head(10).to_string(index=False))
+    parser.add_argument(
+        "--input",
+        default=str(
+            RAW_DIR / RAW_NAME
+        ),
+    )
 
-    out.to_csv(OUTPUT_FILE, index=False)
+    parser.add_argument(
+        "--output_dir",
+        default=str(OUTPUT_DIR),
+    )
 
-    dedup_cols = [
+    parser.add_argument(
+        "--download_missing",
+        action="store_true",
+    )
+
+    args = parser.parse_args()
+
+    raw = Path(args.input).resolve()
+    outdir = Path(args.output_dir).resolve()
+
+    rawdir = raw.parent
+
+    full_file = (
+        outdir
+        / "broad_repurposing_drug_disease.csv"
+    )
+
+    dedup_file = (
+        outdir
+        / "broad_repurposing_drug_disease_deduplicated.csv"
+    )
+
+    summary_file = (
+        outdir
+        / "broad_repurposing_summary.json"
+    )
+
+    # --------------------------------------------------------
+    # SOURCE REUSE AND FILE INVENTORY
+    # --------------------------------------------------------
+
+    obtain_raw(
+        raw,
+        args.download_missing,
+    )
+
+    inventory = inspect_directory(
+        rawdir,
+        raw,
+    )
+
+    heading(
+        "2. ACTUAL SOURCE HEADER, "
+        "FORMAT AND EXAMPLE"
+    )
+
+    header, records, metadata_lines = (
+        read_broad(raw)
+    )
+
+    print(f"Input: {raw}")
+
+    print(
+        "Format: TAB-SEPARATED; "
+        f"skipped {metadata_lines} "
+        "leading metadata/blank lines"
+    )
+
+    print(
+        f"Original header ({len(header)} fields): "
+        + " | ".join(header)
+    )
+
+    print(
+        f"Source data records: {len(records):,}"
+    )
+
+    if records:
+
+        print(
+            "One raw example "
+            "(not a generated indication row):"
+        )
+
+        for key in header:
+            print(
+                f"  {key:<22} "
+                f"{records[0][key][:160]}"
+            )
+
+    # --------------------------------------------------------
+    # EXPLAIN THE TRANSFORMATION
+    # --------------------------------------------------------
+
+    heading(
+        "3. EXACT SOURCE COMBINATION "
+        "AND NAMING RULES"
+    )
+
+    print(
+        "No table JOIN. One source TSV is expanded "
+        "vertically by the 'indication' field."
+    )
+
+    print(
+        "pert_iname -> drug_name; indication split "
+        "on literal '|' -> disease_or_condition_name"
+    )
+
+    print(
+        "clinical_phase / moa / target / disease_area "
+        "remain source annotations."
+    )
+
+    print(
+        "target is never split into drug-disease rows; "
+        "disease_area is never split."
+    )
+
+    print(
+        "Drug and disease IDs are blank: no external "
+        "ID or ontology matches are inferred."
+    )
+
+    print(
+        "Source labels are kept compatible with "
+        "Analysis_00_MergeDatabases.py."
+    )
+
+    print(
+        "relationship_type=drug_indication; "
+        "evidence_type=broad_repurposing_hub"
+    )
+
+    print(
+        "These labels are NOT proof of clinical "
+        "efficacy or regulatory approval."
+    )
+
+    # --------------------------------------------------------
+    # PROCESS
+    # --------------------------------------------------------
+
+    full, counts = process_records(
+        records
+    )
+
+    dedup = deduplicate_preserving_support(
+        full
+    )
+
+    heading(
+        "4. PROCESSING COUNTS AND DUPLICATES"
+    )
+
+    for key, value in counts.items():
+        print(
+            f"  {key:<47} {value}"
+        )
+
+    print(
+        f"  {'deduplicated_assertions':<47} "
+        f"{len(dedup):,}"
+    )
+
+    print(
+        f"  {'redundant_source_records':<47} "
+        f"{len(full) - len(dedup):,}"
+    )
+
+    print("  clinical_phase counts:")
+
+    for phase, n in (
+        full["clinical_phase"]
+        .value_counts(dropna=False)
+        .items()
+    ):
+        print(
+            f"    {phase or '[empty]':<32} "
+            f"{n:,}"
+        )
+
+    # --------------------------------------------------------
+    # SHOW THE OUTPUT SCHEMA
+    # --------------------------------------------------------
+
+    heading(
+        "5. FULL MERGE-COMPATIBLE "
+        "OUTPUT SCHEMA AND SAMPLE"
+    )
+
+    print(
+        f"All {len(COLUMNS)} output fields:"
+    )
+
+    for i, name in enumerate(
+        COLUMNS,
+        start=1,
+    ):
+        print(f"  {i:2d}. {name}")
+
+    print("One actual processed row:")
+
+    for key, value in full.iloc[0].items():
+        print(
+            f"  {key:<42} "
+            f"{str(value)[:170]}"
+        )
+
+    # --------------------------------------------------------
+    # QUALITY CHECKS
+    # --------------------------------------------------------
+
+    for col in [
         "drug_name",
-        "drug_identifier",
         "disease_or_condition_name",
-        "disease_or_condition_identifier",
-        "relationship_type",
-        "evidence_type",
-        "clinical_phase",
-    ]
+        "source",
+    ]:
 
-    dedup = out.drop_duplicates(subset=dedup_cols)
+        if full[col].eq("").any():
+            raise RuntimeError(
+                f"Empty required merge values in: {col}"
+            )
 
-    dedup.to_csv(DEDUP_FILE, index=False)
+    if not (
+        full["source"] == SOURCE_NAME
+    ).all():
+        raise RuntimeError(
+            "Wrong controlled source label"
+        )
 
-    summary = {
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-        "source": "Broad Drug Repurposing Hub",
-        "source_url": "https://repo-hub.broadinstitute.org/repurposing",
-        "data_url": BROAD_DRUG_URL,
-        "citation_doi": "10.1038/nm.4306",
-        "licence": "NON-COMMERCIAL use only",
-        "licence_warning": (
-            "Including Broad-derived rows in a redistributed merged dataset "
-            "may impose non-commercial reuse restrictions on the merged work."
-        ),
-        "processing_note": (
-            "The indication field is split on '|'. The disease_area field is "
-            "preserved as category metadata and is not expanded. The clinical_phase "
-            "field is preserved as metadata and is not used to reclassify "
-            "relationship_type or evidence_type."
-        ),
-        "input_file": DRUG_FILE,
-        "input_file_size_bytes": int(file_size),
-        "input_file_sha256": file_sha256,
-        "rows_in_source_file": int(len(df)),
-        "rows_skipped_no_drug": int(skipped_no_drug),
-        "rows_skipped_no_indication": int(skipped_no_indication),
-        "rows_written": int(len(out)),
-        "deduplicated_rows_written": int(len(dedup)),
-        "expanded_rows_from_multi_indication": int(
-            expanded_rows_from_multi_indication
-        ),
-        "unique_drugs": int(out["drug_name"].nunique()) if len(out) else 0,
-        "unique_diseases": (
-            int(out["disease_or_condition_name"].nunique())
-            if len(out)
-            else 0
-        ),
-        "unique_disease_areas": (
-            int(out["disease_area"].nunique())
-            if len(out)
-            else 0
-        ),
-        "clinical_phase_counts": (
-            out["clinical_phase"].value_counts().to_dict()
-            if len(out)
-            else {}
-        ),
-        "relationship_type_counts": (
-            out["relationship_type"].value_counts().to_dict()
-            if len(out)
-            else {}
-        ),
-        "evidence_type_counts": (
-            out["evidence_type"].value_counts().to_dict()
-            if len(out)
-            else {}
-        ),
-        "output_file": OUTPUT_FILE,
-        "deduplicated_file": DEDUP_FILE,
-        "summary_file": SUMMARY_FILE,
-        "standard_columns": STANDARD_COLUMNS,
-        "deduplication_columns": dedup_cols,
+    if len(dedup) > len(full):
+        raise RuntimeError(
+            "Invalid deduplication result"
+        )
+
+    # --------------------------------------------------------
+    # OVERWRITE CURRENT OUTPUTS
+    # --------------------------------------------------------
+
+    heading(
+        "6. OVERWRITING ORIGINAL "
+        "PROCESSED OUTPUTS"
+    )
+
+    atomic_csv(
+        full,
+        full_file,
+    )
+
+    atomic_csv(
+        dedup,
+        dedup_file,
+    )
+
+    # --------------------------------------------------------
+    # METADATA
+    # --------------------------------------------------------
+
+    report = {
+        "status": "success",
+
+        "timestamp_utc": timestamp(),
+
+        "source": SOURCE_NAME,
+
+        "source_url":
+            "https://repo-hub.broadinstitute.org/repurposing",
+
+        "data_url": SOURCE_URL,
+
+        "dataset_snapshot": RAW_NAME,
+
+        "citation_doi":
+            "10.1038/nm.4306",
+
+        "licence":
+            "Non-commercial source data",
+
+        "licence_warning":
+            "Check source terms before redistribution "
+            "of Broad-derived rows.",
+
+        "input_file": str(raw),
+
+        "input_size_bytes":
+            raw.stat().st_size,
+
+        "input_file_sha256":
+            sha256(raw),
+
+        "raw_file_inventory":
+            inventory,
+
+        "input_format":
+            "tab-separated values, "
+            "metadata lines prefixed !",
+
+        "metadata_lines_skipped":
+            metadata_lines,
+
+        "input_header": header,
+
+        "combination":
+            "one file; split pipe-separated "
+            "indication into one row per "
+            "indication; no JOIN",
+
+        "field_mapping": {
+            "pert_iname": "drug_name",
+            "indication":
+                "disease_or_condition_name",
+            "clinical_phase": "clinical_phase",
+            "moa": "moa",
+            "target": "target",
+            "disease_area": "disease_area",
+        },
+
+        "source_semantics":
+            "source drug-indication annotation, "
+            "not proof of approval or efficacy",
+
+        **counts,
+
+        "deduplicated_rows_written":
+            len(dedup),
+
+        "deduplication_columns":
+            ASSERTION_KEY,
+
+        "deduplication_provenance":
+            "source row numbers and indication "
+            "indices aggregated in dedup file",
+
+        "unique_drugs":
+            int(full["drug_name"].nunique()),
+
+        "unique_diseases":
+            int(
+                full[
+                    "disease_or_condition_name"
+                ].nunique()
+            ),
+
+        "clinical_phase_counts":
+            full["clinical_phase"]
+            .value_counts()
+            .to_dict(),
+
+        "relationship_type_counts":
+            full["relationship_type"]
+            .value_counts()
+            .to_dict(),
+
+        "evidence_type_counts":
+            full["evidence_type"]
+            .value_counts()
+            .to_dict(),
+
+        "standard_columns": COLUMNS,
+
+        "output_file": str(full_file),
+
+        "deduplicated_file": str(dedup_file),
+
+        "summary_file": str(summary_file),
+
+        "output_sha256":
+            sha256(full_file),
+
+        "deduplicated_sha256":
+            sha256(dedup_file),
     }
 
-    with open(SUMMARY_FILE, "w") as f:
-        json.dump(summary, f, indent=2)
+    atomic_json(
+        report,
+        summary_file,
+    )
 
-    print("=" * 100)
-    print("DONE")
-    print("=" * 100)
-    print(f"[OUTPUT]  {OUTPUT_FILE}")
-    print(f"[DEDUP]   {DEDUP_FILE}")
-    print(f"[SUMMARY] {SUMMARY_FILE}")
-    print("=" * 100)
+    for output in [
+        full_file,
+        dedup_file,
+        summary_file,
+    ]:
+        print(f"  [WRITTEN] {output}")
+
+    print(
+        "\nSUCCESS. Use the full non-deduplicated "
+        "CSV as the source for the final merger."
+    )
 
 
 if __name__ == "__main__":

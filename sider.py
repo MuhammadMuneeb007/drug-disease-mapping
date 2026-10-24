@@ -1,128 +1,53 @@
+
 #!/usr/bin/env python3
+"""SIDER 4.1 -> merge-compatible label phenotype evidence with strict indication view.
+
+Default: reuse pinned raw files in data/raw/sider; overwrite existing processed
+files in data/processed/sider only after source validations succeed.
+
+NLP_indication, NLP_precondition, and text_mention are distinct. Only the first
+is included in the strict SIDER indication view; no row proves FDA approval.
 """
-SIDER 4.1 -> unified drug-disease / drug-indication mapping CSV
-
-Purpose
--------
-Download and process SIDER 4.1 drug indication records into a
-publication-ready, provenance-aware CSV using the same unified
-multi-source drug-disease schema used by the other source processors.
-
-Source
-------
-SIDER 4.1:
-    http://sideeffects.embl.de/
-
-Files used
-----------
-drug_names.tsv
-meddra_all_indications.tsv.gz
-
-Correct observed SIDER indication schema
-----------------------------------------
-meddra_all_indications.tsv.gz is parsed as a 7-column file:
-
-    raw_col_0 = drug_id, e.g. CID100000085
-    raw_col_1 = source_concept_id
-    raw_col_2 = extraction_method, e.g. text_mention / NLP_indication
-    raw_col_3 = source_concept_name
-    raw_col_4 = meddra_concept_type, e.g. LLT / PT
-    raw_col_5 = disease_id, e.g. C0015544
-    raw_col_6 = disease_name, e.g. Failure to Thrive
-
-Interpretation
---------------
-SIDER indications are label-derived drug-indication / phenotype records.
-They should not be interpreted as direct evidence of clinical efficacy or
-regulatory approval without additional validation.
-
-Unified output columns
-----------------------
-drug_name
-drug_identifier
-drug_identifier_type
-disease_or_condition_name
-disease_or_condition_identifier
-disease_or_condition_identifier_type
-relationship_type
-evidence_type
-source
-internal_source
-
-SIDER-specific metadata columns
--------------------------------
-sider_drug_id
-source_concept_id
-source_concept_name
-meddra_concept_type
-extraction_method
-relationship
-raw_col_0
-raw_col_1
-raw_col_2
-raw_col_3
-raw_col_4
-raw_col_5
-raw_col_6
-
-Default output
---------------
-/data/ascher02/uqmmune1/ANNOVAR/drug_disease_data/drug-disease-mapping/data/processed/sider/sider_drug_disease.csv
-/data/ascher02/uqmmune1/ANNOVAR/drug_disease_data/drug-disease-mapping/data/processed/sider/sider_drug_disease_deduplicated.csv
-/data/ascher02/uqmmune1/ANNOVAR/drug_disease_data/drug-disease-mapping/data/processed/sider/sider_summary.json
-
-Requirements
-------------
-pip install pandas requests
-"""
-
 from __future__ import annotations
 
 import argparse
 import csv
+import gzip
 import hashlib
 import json
+import os
+import re
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Tuple
 
 import pandas as pd
-import requests
 
+ROOT = Path(
+    os.environ.get(
+        "DRUG_DISEASE_ROOT",
+        Path(__file__).resolve().parent,
+    )
+).resolve()
 
-# ============================================================
-# CONFIG
-# ============================================================
+RAW = ROOT / "data/raw/sider"
+OUT = ROOT / "data/processed/sider"
 
-PROJECT_ROOT = Path(
-    "/data/ascher02/uqmmune1/ANNOVAR/drug_disease_data/"
-    "drug-disease-mapping"
+URL_PREFIX = "https://sideeffects.embl.de/media/download"
+
+FILE_NAMES = (
+    "drug_names.tsv",
+    "meddra_all_indications.tsv.gz",
 )
 
-SOURCE_NAME = "SIDER4.1"
+SOURCE = "SIDER4.1"
 
-BASE_URL_CANDIDATES = [
-    "https://sideeffects.embl.de/media/download",
-    "http://sideeffects.embl.de/media/download",
+RAW_KEYS = [
+    f"raw_col_{i}"
+    for i in range(7)
 ]
 
-FILES = {
-    "drug_names": "drug_names.tsv",
-    "indications": "meddra_all_indications.tsv.gz",
-}
-
-RAW_DIR = PROJECT_ROOT / "data" / "raw" / "sider"
-OUTPUT_DIR = PROJECT_ROOT / "data" / "processed" / "sider"
-
-OUTPUT_FILE = OUTPUT_DIR / "sider_drug_disease.csv"
-DEDUP_FILE = OUTPUT_DIR / "sider_drug_disease_deduplicated.csv"
-SUMMARY_FILE = OUTPUT_DIR / "sider_summary.json"
-
-UA = "Mozilla/5.0 (SIDERDrugDiseaseExporter/5.0)"
-
-
-OUTPUT_COLUMNS = [
-    # Unified schema
+CORE = [
     "drug_name",
     "drug_identifier",
     "drug_identifier_type",
@@ -133,8 +58,9 @@ OUTPUT_COLUMNS = [
     "evidence_type",
     "source",
     "internal_source",
+]
 
-    # SIDER-specific metadata
+EXTRA = [
     "sider_drug_id",
     "source_concept_id",
     "source_concept_name",
@@ -142,806 +68,1211 @@ OUTPUT_COLUMNS = [
     "extraction_method",
     "relationship",
     "evidence_text",
-
-    # Raw retained columns for traceability
-    "raw_col_0",
-    "raw_col_1",
-    "raw_col_2",
-    "raw_col_3",
-    "raw_col_4",
-    "raw_col_5",
-    "raw_col_6",
+    *RAW_KEYS,
+    "extraction_evidence_quality",
+    "meddra_llt_same_cui_as_pt",
+    "drug_name_match_status",
+    "sider_source_row_index",
+    "sider_source_line_number",
+    "sider_disease_name_match_status",
+    "sider_record_granularity",
 ]
 
+for entity in ("drug", "disease"):
+    EXTRA += [
+        f"{entity}_identifier_{field}"
+        for field in (
+            "original",
+            "namespace",
+            "canonical",
+            "validation",
+        )
+    ]
 
-# ============================================================
-# HELPERS
-# ============================================================
+COLS = CORE + EXTRA
 
-def now_utc() -> str:
+REJECT_COLS = [
+    "sider_source_row_index",
+    "sider_source_line_number",
+    "reason",
+    *RAW_KEYS,
+]
+
+METHODS = {
+    "nlp_indication": (
+        "label_nlp_indication",
+        "sider_nlp_classified_indication",
+        "nlp_classified_indication",
+    ),
+    "nlp_precondition": (
+        "label_precondition",
+        "sider_nlp_classified_precondition",
+        "nlp_classified_precondition",
+    ),
+    "text_mention": (
+        "label_text_mention",
+        "sider_unclassified_text_mention",
+        "unclassified_text_mention",
+    ),
+}
+
+
+def ts():
     return datetime.now(timezone.utc).isoformat()
 
 
-def print_section(title: str) -> None:
-    print("\n" + "=" * 100)
-    print(title)
-    print("=" * 100)
+def section(label):
+    print(
+        "\n" + "=" * 88
+        + "\n" + label
+        + "\n" + "=" * 88,
+        flush=True,
+    )
 
 
-def clean_cell(x: Any) -> str:
-    if x is None:
-        return ""
-
-    try:
-        if pd.isna(x):
-            return ""
-    except Exception:
-        pass
-
-    return str(x).strip()
-
-
-def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+def hash_file(path):
     h = hashlib.sha256()
 
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(chunk_size), b""):
-            h.update(chunk)
+    with Path(path).open("rb") as stream:
+        for part in iter(
+            lambda: stream.read(4 * 1024 * 1024),
+            b"",
+        ):
+            h.update(part)
 
     return h.hexdigest()
 
 
-def human_size(num_bytes: int) -> str:
-    size = float(num_bytes)
-
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if size < 1024:
-            return f"{size:.2f} {unit}"
-        size /= 1024
-
-    return f"{size:.2f} PB"
+def normal(value):
+    return (
+        str(value).strip()
+        if value is not None
+        else ""
+    )
 
 
-def count_missing_or_empty(df: pd.DataFrame) -> pd.DataFrame:
-    rows = []
+def id_info(identifier, entity):
+    """
+    Syntax validation only.
 
-    for col in df.columns:
-        s = df[col]
-        missing_count = int(s.isna().sum())
-        empty_count = int(s.fillna("").astype(str).str.strip().eq("").sum())
+    No external chemical or disease mapping
+    is inferred here.
+    """
+    original = normal(identifier)
+    upper = original.upper()
 
-        rows.append(
-            {
-                "column": col,
-                "missing_count": missing_count,
-                "missing_percent": round(
-                    missing_count / max(len(df), 1) * 100,
-                    3,
-                ),
-                "empty_string_count": empty_count,
-                "empty_string_percent": round(
-                    empty_count / max(len(df), 1) * 100,
-                    3,
+    if not original:
+        return original, "", "", "missing"
+
+    if entity == "drug":
+        valid = bool(
+            re.fullmatch(
+                r"CID[01]\d{8}",
+                upper,
+            )
+        )
+
+        return (
+            original,
+            "STITCH" if valid else "unresolved",
+            "STITCH:" + upper if valid else "",
+            "syntax_valid"
+            if valid
+            else "unrecognised_or_invalid",
+        )
+
+    valid = bool(
+        re.fullmatch(
+            r"C\d{7}",
+            upper,
+        )
+    )
+
+    return (
+        original,
+        "UMLS" if valid else "unresolved",
+        "UMLS:" + upper if valid else "",
+        "syntax_valid"
+        if valid
+        else "unrecognised_or_invalid",
+    )
+
+
+def obtain(
+    path,
+    download_missing,
+    force_download,
+):
+    if (
+        path.is_file()
+        and path.stat().st_size
+        and not force_download
+    ):
+        print("[REUSE]", path)
+        return
+
+    if not (
+        download_missing
+        or force_download
+    ):
+        raise FileNotFoundError(
+            f"Required pinned input missing: {path}; "
+            "use --download-missing"
+        )
+
+    import requests
+
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    url = URL_PREFIX + "/" + path.name
+
+    tmp = path.with_name(
+        path.name + ".download"
+    )
+
+    try:
+        print("[DOWNLOAD]", url)
+
+        with requests.get(
+            url,
+            stream=True,
+            timeout=(30, 600),
+        ) as response:
+            response.raise_for_status()
+
+            with tmp.open("wb") as file:
+                for block in response.iter_content(
+                    4 * 1024 * 1024
+                ):
+                    if block:
+                        file.write(block)
+
+        if not tmp.stat().st_size:
+            raise RuntimeError(
+                "Downloaded source was empty: "
+                + path.name
+            )
+
+        if path.suffix == ".gz":
+            with gzip.open(tmp, "rb") as g:
+                if not g.read(1):
+                    raise RuntimeError(
+                        "Downloaded gzip file was empty"
+                    )
+        else:
+            with tmp.open("rb") as f:
+                if not f.read(1):
+                    raise RuntimeError(
+                        "Downloaded name table was empty"
+                    )
+
+        tmp.replace(path)
+
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def names_lookup(path):
+    """
+    Build an ID-to-name mapping only when
+    one identifier has an unambiguous name.
+
+    Conflicting names are audited.
+    """
+    names = defaultdict(set)
+    rows = 0
+    example = None
+
+    with path.open(
+        "r",
+        encoding="utf-8-sig",
+        newline="",
+    ) as file:
+
+        reader = csv.reader(
+            file,
+            delimiter="\t",
+            strict=True,
+        )
+
+        for row in reader:
+            rows += 1
+
+            if len(row) != 2:
+                raise RuntimeError(
+                    f"drug_names.tsv record {rows}: "
+                    "expected 2 fields, "
+                    f"got {len(row)}"
+                )
+
+            if example is None:
+                example = row
+
+            drug, label = map(normal, row)
+
+            if drug and label:
+                names[drug].add(label)
+
+    if not rows:
+        raise RuntimeError(
+            "drug_names.tsv contains zero records"
+        )
+
+    unique = {
+        drug: next(iter(values))
+        for drug, values in names.items()
+        if len(values) == 1
+    }
+
+    conflicts = {
+        drug: sorted(values)
+        for drug, values in names.items()
+        if len(values) > 1
+    }
+
+    print(
+        f"[NAME TABLE] source={rows:,}; "
+        f"IDs={len(names):,}; "
+        f"unambiguous={len(unique):,}; "
+        f"conflicts={len(conflicts):,}"
+    )
+
+    print("[NAME RAW EXAMPLE]", example)
+
+    stats = {
+        "source_rows": rows,
+        "distinct_ids": len(names),
+        "conflicting_ids": len(conflicts),
+        "conflict_examples": dict(
+            list(conflicts.items())[:20]
+        ),
+    }
+
+    return unique, conflicts, stats
+
+
+def read_indications(path):
+    """
+    Strict seven-column headerless TSV reader.
+
+    Preserve each original record and its location.
+    """
+    records = []
+    first = None
+
+    with gzip.open(
+        path,
+        "rt",
+        encoding="utf-8-sig",
+        newline="",
+    ) as handle:
+
+        reader = csv.reader(
+            handle,
+            delimiter="\t",
+            strict=True,
+        )
+
+        for number, cells in enumerate(
+            reader,
+            1,
+        ):
+            if len(cells) != 7:
+                raise RuntimeError(
+                    f"indications source row {number}: "
+                    "expected exactly 7 columns, "
+                    f"got {len(cells)}"
+                )
+
+            if first is None:
+                first = cells.copy()
+
+            records.append(
+                (
+                    number,
+                    reader.line_num,
+                    cells,
+                )
+            )
+
+    if not records:
+        raise RuntimeError(
+            "The indication file has zero rows"
+        )
+
+    print(
+        "[INDICATION TABLE] source rows:",
+        f"{len(records):,}",
+    )
+
+    print(
+        "[ORIGINAL SCHEMA]",
+        RAW_KEYS,
+    )
+
+    print(
+        "[FIRST ORIGINAL RECORD]",
+        dict(zip(RAW_KEYS, first)),
+    )
+
+    return records
+
+
+def make_row(
+    index,
+    line,
+    cells,
+    names,
+    conflicts,
+):
+    (
+        drug,
+        source_id,
+        method,
+        source_name,
+        level,
+        disease,
+        disease_name,
+    ) = map(normal, cells)
+
+    missing = [
+        key
+        for key, field in (
+            ("drug_id", drug),
+            ("disease_id", disease),
+        )
+        if not field
+    ]
+
+    if missing:
+        return None, (
+            dict(zip(RAW_KEYS, cells))
+            | {
+                "sider_source_row_index": str(index),
+                "sider_source_line_number": str(line),
+                "reason": "|".join(
+                    "missing_" + key
+                    for key in missing
                 ),
             }
         )
 
-    return pd.DataFrame(rows)
+    # Do not choose arbitrary names
+    # where an identifier has conflicts.
 
-
-def download_one_url(url: str, out_path: Path, timeout: int = 300) -> Path:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    print(f"  [TRY] {url}")
-
-    with requests.get(
-        url,
-        headers={"User-Agent": UA},
-        stream=True,
-        timeout=timeout,
-    ) as r:
-        r.raise_for_status()
-
-        tmp = out_path.with_suffix(out_path.suffix + ".part")
-
-        with open(tmp, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    f.write(chunk)
-
-        tmp.replace(out_path)
-
-    return out_path
-
-
-def download_with_fallback(
-    filename: str,
-    out_path: Path,
-    timeout: int = 300,
-    force: bool = False,
-) -> Tuple[Path, str]:
-    if out_path.exists() and out_path.stat().st_size > 0 and not force:
-        print(f"  [CACHED] {out_path}")
-        print(f"           Size:   {human_size(out_path.stat().st_size)}")
-        print(f"           SHA256: {sha256_file(out_path)}")
-        return out_path, "cached"
-
-    if out_path.exists() and force:
-        out_path.unlink()
-
-    last_error = None
-
-    for base_url in BASE_URL_CANDIDATES:
-        url = f"{base_url.rstrip('/')}/{filename}"
-
-        try:
-            path = download_one_url(url, out_path, timeout=timeout)
-
-            print(f"  [DOWNLOADED] {path}")
-            print(f"               Size:   {human_size(path.stat().st_size)}")
-            print(f"               SHA256: {sha256_file(path)}")
-
-            return path, url
-
-        except Exception as e:
-            last_error = e
-            print(f"  [FAILED] {url}")
-            print(f"           {repr(e)}")
-
-    raise RuntimeError(
-        f"Could not download {filename} from SIDER endpoints. "
-        f"Last error: {repr(last_error)}"
-    )
-
-
-def read_tsv(path: Path, gz: bool = False) -> pd.DataFrame:
-    return pd.read_csv(
-        path,
-        sep="\t",
-        header=None,
-        compression="gzip" if gz else None,
-        dtype=str,
-        low_memory=False,
-        keep_default_na=False,
-    )
-
-
-def infer_sider_drug_identifier_type(drug_id: str) -> str:
-    drug_id = clean_cell(drug_id)
-
-    if not drug_id:
-        return ""
-
-    if drug_id.startswith("CID"):
-        return "SIDER_STITCH_CID"
-
-    return "SIDER_DrugID"
-
-
-def infer_disease_identifier_type(disease_id: str) -> str:
-    disease_id = clean_cell(disease_id)
-
-    if not disease_id:
-        return ""
-
-    upper = disease_id.upper()
-
-    # SIDER MedDRA indications commonly use UMLS-style CUI disease IDs.
-    if upper.startswith("C") and upper[1:].isdigit():
-        return "UMLS"
-
-    if upper.startswith("UMLS:"):
-        return "UMLS"
-
-    if upper.startswith("MESH:"):
-        return "MeSH"
-
-    if upper.startswith("MEDDRA:"):
-        return "MedDRA"
-
-    return "SIDER_DiseaseID"
-
-
-# ============================================================
-# LOADERS
-# ============================================================
-
-def load_drug_names(path: Path) -> Tuple[pd.DataFrame, Dict[str, str]]:
-    print_section("Loading SIDER drug_names.tsv")
-    print(f"[FILE] {path}")
-
-    df = read_tsv(path, gz=False)
-
-    if df.shape[1] < 2:
-        raise RuntimeError(
-            f"drug_names.tsv has unexpected number of columns: {df.shape[1]}"
+    if drug in conflicts:
+        drug_label = drug
+        match = (
+            "ambiguous_names_identifier_placeholder"
         )
 
-    df = df.iloc[:, :2].copy()
-    df.columns = ["drug_id", "drug_name"]
+    elif drug in names:
+        drug_label = names[drug]
+        match = "matched"
 
-    df["drug_id"] = df["drug_id"].map(clean_cell)
-    df["drug_name"] = df["drug_name"].map(clean_cell)
-
-    df = df[
-        (df["drug_id"] != "")
-        & (df["drug_name"] != "")
-    ].copy()
-
-    drug_name_map = (
-        df.drop_duplicates(subset=["drug_id"], keep="first")
-        .set_index("drug_id")["drug_name"]
-        .to_dict()
-    )
-
-    print(f"[ROWS] {len(df):,}")
-    print(f"[UNIQUE DRUG IDS] {df['drug_id'].nunique():,}")
-    print(f"[PRIMARY NAME MAP] {len(drug_name_map):,}")
-
-    print("\n[HEAD]")
-    print(df.head(10).to_string(index=False))
-
-    return df, drug_name_map
-
-
-def load_indications(path: Path) -> pd.DataFrame:
-    print_section("Loading SIDER meddra_all_indications.tsv.gz")
-    print(f"[FILE] {path}")
-
-    raw = read_tsv(path, gz=True)
-
-    print(f"[RAW ROWS] {len(raw):,}")
-    print(f"[RAW COLUMNS] {raw.shape[1]:,}")
-
-    if raw.shape[1] < 7:
-        raise RuntimeError(
-            f"Expected at least 7 columns in meddra_all_indications.tsv.gz, "
-            f"but found {raw.shape[1]}."
+    else:
+        drug_label = drug
+        match = (
+            "unmatched_identifier_placeholder"
         )
 
-    df = raw.copy()
-    df.columns = [f"raw_col_{i}" for i in range(raw.shape[1])]
+    disease_label = disease_name or disease
 
-    # Correct SIDER 7-column schema.
-    df["drug_id"] = df["raw_col_0"].map(clean_cell)
-    df["source_concept_id"] = df["raw_col_1"].map(clean_cell)
-    df["extraction_method"] = df["raw_col_2"].map(clean_cell)
-    df["source_concept_name"] = df["raw_col_3"].map(clean_cell)
-    df["meddra_concept_type"] = df["raw_col_4"].map(clean_cell)
-    df["disease_id"] = df["raw_col_5"].map(clean_cell)
-    df["disease_name"] = df["raw_col_6"].map(clean_cell)
+    disease_status = (
+        "provided"
+        if disease_name
+        else "identifier_placeholder"
+    )
 
-    parsed_cols = [
-        "drug_id",
+    (
+        relation,
+        evidence,
+        quality,
+    ) = METHODS.get(
+        method.casefold(),
+        (
+            "label_unclassified",
+            "sider_unrecognised_extraction_method",
+            "unrecognised_method"
+            if method
+            else "missing_method",
+        ),
+    )
+
+    drug_id = id_info(
+        drug,
+        "drug",
+    )
+
+    disease_id = id_info(
+        disease,
+        "disease",
+    )
+
+    row = {
+        "drug_name": drug_label,
+        "drug_identifier": drug,
+        "drug_identifier_type":
+            drug_id[1] or "unresolved",
+
+        "disease_or_condition_name":
+            disease_label,
+
+        "disease_or_condition_identifier":
+            disease,
+
+        "disease_or_condition_identifier_type":
+            disease_id[1] or "unresolved",
+
+        "relationship_type": relation,
+        "evidence_type": evidence,
+
+        "source": SOURCE,
+        "internal_source":
+            "SIDER_meddra_all_indications",
+
+        "sider_drug_id": drug,
+        "source_concept_id": source_id,
+        "source_concept_name": source_name,
+        "meddra_concept_type": level,
+        "extraction_method": method,
+        "relationship": relation,
+
+        "evidence_text": (
+            f"source_concept_id={source_id}; "
+            f"extraction_method={method}; "
+            f"MedDRA_level={level}"
+        ),
+
+        **{
+            f"raw_col_{i}": cells[i]
+            for i in range(7)
+        },
+
+        "extraction_evidence_quality": quality,
+        "meddra_llt_same_cui_as_pt": "False",
+        "drug_name_match_status": match,
+        "sider_source_row_index": str(index),
+        "sider_source_line_number": str(line),
+
+        "sider_disease_name_match_status":
+            disease_status,
+
+        "sider_record_granularity":
+            "original_SIDER_indication_file_row",
+    }
+
+    for entity, vals in (
+        ("drug", drug_id),
+        ("disease", disease_id),
+    ):
+        for field, val in zip(
+            (
+                "original",
+                "namespace",
+                "canonical",
+                "validation",
+            ),
+            vals,
+        ):
+            row[
+                f"{entity}_identifier_{field}"
+            ] = val
+
+    return row, None
+
+
+def deduplicated(df):
+    """
+    Assertion-level reporting view.
+
+    All original source rows remain
+    in the full CSV.
+
+    Different source concepts, methods
+    and MedDRA levels remain distinct.
+    """
+    keys = [
+        "drug_identifier",
+        "disease_or_condition_identifier",
+        "disease_or_condition_name",
         "source_concept_id",
-        "extraction_method",
         "source_concept_name",
         "meddra_concept_type",
-        "disease_id",
-        "disease_name",
+        "extraction_method",
+        "relationship_type",
+        "evidence_type",
     ]
 
-    print("[PARSED COLUMNS]")
-    for col in parsed_cols:
-        print(f"  - {col}")
-
-    print("\n[HEAD]")
-    print(df[parsed_cols].head(10).to_string(index=False))
-
-    return df
-
-
-# ============================================================
-# PROCESSING
-# ============================================================
-
-def build_output(
-    indications: pd.DataFrame,
-    drug_name_map: Dict[str, str],
-) -> pd.DataFrame:
-    print_section("Building unified SIDER drug-disease output")
-
-    df = indications.copy()
-
-    out = pd.DataFrame()
-
-    sider_drug_id = df["drug_id"].map(clean_cell)
-    disease_id = df["disease_id"].map(clean_cell)
-    disease_name = df["disease_name"].map(clean_cell)
-
-    out["drug_name"] = sider_drug_id.map(lambda x: drug_name_map.get(x, ""))
-    out["drug_identifier"] = sider_drug_id
-    out["drug_identifier_type"] = sider_drug_id.map(infer_sider_drug_identifier_type)
-
-    out["disease_or_condition_name"] = disease_name
-    out["disease_or_condition_identifier"] = disease_id
-    out["disease_or_condition_identifier_type"] = disease_id.map(
-        infer_disease_identifier_type
+    groups = df.groupby(
+        keys,
+        sort=False,
+        dropna=False,
     )
 
-    out["relationship_type"] = "indication"
-    out["evidence_type"] = "sider_label_derived_indication"
-
-    out["source"] = SOURCE_NAME
-    out["internal_source"] = "SIDER_meddra_all_indications"
-
-    # SIDER-specific metadata.
-    out["sider_drug_id"] = sider_drug_id
-    out["source_concept_id"] = df["source_concept_id"].map(clean_cell)
-    out["source_concept_name"] = df["source_concept_name"].map(clean_cell)
-    out["meddra_concept_type"] = df["meddra_concept_type"].map(clean_cell)
-    out["extraction_method"] = df["extraction_method"].map(clean_cell)
-    out["relationship"] = "indication"
-
-    out["evidence_text"] = (
-        "source_concept_id="
-        + out["source_concept_id"].astype(str)
-        + "; source_concept_name="
-        + out["source_concept_name"].astype(str)
-        + "; meddra_concept_type="
-        + out["meddra_concept_type"].astype(str)
-        + "; extraction_method="
-        + out["extraction_method"].astype(str)
+    output = (
+        groups.first()
+        .reset_index()
+        .reindex(columns=COLS)
     )
 
-    # Retain raw columns for traceability.
-    for i in range(7):
-        raw_col = f"raw_col_{i}"
+    support = (
+        groups["sider_source_row_index"]
+        .agg("|".join)
+        .rename("sider_supporting_source_rows")
+        .reset_index()
+    )
 
-        if raw_col in df.columns:
-            out[raw_col] = df[raw_col].map(clean_cell)
+    counts = (
+        groups.size()
+        .rename("sider_supporting_record_count")
+        .reset_index()
+    )
+
+    output = output.merge(
+        support,
+        on=keys,
+        validate="one_to_one",
+    )
+
+    output = output.merge(
+        counts,
+        on=keys,
+        validate="one_to_one",
+    )
+
+    if int(
+        output[
+            "sider_supporting_record_count"
+        ].sum()
+    ) != len(df):
+        raise RuntimeError(
+            "Deduplicated support count does not "
+            "match full records"
+        )
+
+    return output, keys
+
+
+def write_staged(frame, dest):
+    """
+    Stage output before overwriting
+    the original destination.
+    """
+    dest.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    temp = dest.with_name(
+        dest.name + ".processing.tmp"
+    )
+
+    frame.to_csv(
+        temp,
+        index=False,
+    )
+
+    with temp.open(
+        "r",
+        encoding="utf-8",
+        newline="",
+    ) as f:
+        if next(csv.reader(f)) != list(frame.columns):
+            raise RuntimeError(
+                f"Output header mismatch: {dest}"
+            )
+
+    return temp
+
+
+def main():
+    p = argparse.ArgumentParser(
+        description=__doc__
+    )
+
+    p.add_argument(
+        "--workdir",
+        type=Path,
+        default=RAW,
+    )
+
+    p.add_argument(
+        "--out",
+        type=Path,
+        default=OUT / "sider_drug_disease.csv",
+    )
+
+    p.add_argument(
+        "--dedup_out",
+        type=Path,
+        default=(
+            OUT /
+            "sider_drug_disease_deduplicated.csv"
+        ),
+    )
+
+    p.add_argument(
+        "--pt_out",
+        type=Path,
+        default=OUT / "sider_drug_disease_pt_only.csv",
+    )
+
+    p.add_argument(
+        "--unmatched_out",
+        type=Path,
+        default=OUT / "sider_unmatched_drug_ids.csv",
+    )
+
+    p.add_argument(
+        "--metadata",
+        type=Path,
+        default=OUT / "sider_summary.json",
+    )
+
+    p.add_argument(
+        "--download-missing",
+        action="store_true",
+    )
+
+    p.add_argument(
+        "--force_download",
+        "--force-download",
+        action="store_true",
+    )
+
+    args = p.parse_args()
+
+    raw = args.workdir.resolve()
+
+    paths = {
+        name: raw / name
+        for name in FILE_NAMES
+    }
+
+    # ========================================================
+    # 1. FILE INVENTORY
+    # ========================================================
+
+    section("1. RAW INPUT INVENTORY")
+
+    for path in paths.values():
+        obtain(
+            path,
+            args.download_missing,
+            args.force_download,
+        )
+
+    inventory = []
+
+    for path in sorted(raw.rglob("*")):
+        if path.is_file():
+            info = {
+                "path": str(
+                    path.relative_to(raw)
+                ),
+                "bytes": path.stat().st_size,
+                "input": (
+                    path.resolve()
+                    in {
+                        x.resolve()
+                        for x in paths.values()
+                    }
+                ),
+            }
+
+            inventory.append(info)
+
+            print(
+                "[INPUT]"
+                if info["input"]
+                else "[OTHER]",
+                info,
+            )
+
+    hashes = {
+        name: hash_file(path)
+        for name, path in paths.items()
+    }
+
+    # ========================================================
+    # 2. ORIGINAL SCHEMA AND ROW COUNTS
+    # ========================================================
+
+    section(
+        "2. ORIGINAL SCHEMAS "
+        "AND RECORD COUNTS"
+    )
+
+    names, conflicts, names_stats = (
+        names_lookup(
+            paths["drug_names.tsv"]
+        )
+    )
+
+    sources = read_indications(
+        paths["meddra_all_indications.tsv.gz"]
+    )
+
+    # ========================================================
+    # 3. SCIENTIFIC MAPPING RULES
+    # ========================================================
+
+    section(
+        "3. MERGE RULE / "
+        "EVIDENCE INTERPRETATION"
+    )
+
+    print(
+        "Join drug_names TSV column 0 to "
+        "indications TSV column 0 "
+        "by exact STITCH compound ID."
+    )
+
+    print(
+        "Seven original indication columns "
+        "retained; every source event "
+        "has a row index."
+    )
+
+    print(
+        "NLP_indication = label NLP classification."
+    )
+
+    print(
+        "NLP_precondition = label precondition."
+    )
+
+    print(
+        "text_mention = unclassified label mention."
+    )
+
+    print(
+        "Unknown methods = unclassified."
+    )
+
+    print(
+        "Source records are NOT FDA approvals "
+        "or validated therapeutic efficacy."
+    )
+
+    # ========================================================
+    # 4. TRANSFORM
+    # ========================================================
+
+    out_rows = []
+    rejects = []
+
+    for row_index, line, cells in sources:
+        record, bad = make_row(
+            row_index,
+            line,
+            cells,
+            names,
+            conflicts,
+        )
+
+        if bad is None:
+            out_rows.append(record)
         else:
-            out[raw_col] = ""
+            rejects.append(bad)
 
-    before = len(out)
+    full = pd.DataFrame(
+        out_rows,
+        columns=COLS,
+    )
 
-    out = out[
-        (out["drug_identifier"] != "")
-        & (out["disease_or_condition_identifier"] != "")
-        & (out["disease_or_condition_name"] != "")
+    rejected = pd.DataFrame(
+        rejects,
+        columns=REJECT_COLS,
+    )
+
+    if (
+        full.empty
+        or len(full) + len(rejected) != len(sources)
+    ):
+        raise RuntimeError(
+            "No valid evidence or source "
+            "row accounting failed"
+        )
+
+    # Identify LLT records with a matching
+    # PT-level CUI, without removing them.
+
+    pt_rows = full.loc[
+        full["meddra_concept_type"].eq("PT")
+    ]
+
+    pt_keys = set(zip(
+        pt_rows["drug_identifier"],
+        pt_rows["source_concept_id"],
+        pt_rows["extraction_method"],
+        pt_rows["disease_or_condition_identifier"],
+    ))
+
+    full["meddra_llt_same_cui_as_pt"] = [
+        str(
+            level == "LLT"
+            and (
+                drug,
+                source,
+                method,
+                disease,
+            ) in pt_keys
+        )
+        for (
+            drug,
+            source,
+            method,
+            disease,
+            level,
+        ) in full[
+            [
+                "drug_identifier",
+                "source_concept_id",
+                "extraction_method",
+                "disease_or_condition_identifier",
+                "meddra_concept_type",
+            ]
+        ].itertuples(
+            index=False,
+            name=None,
+        )
+    ]
+
+    dedup, dedup_keys = deduplicated(full)
+
+    # Existing PT-only view retains
+    # every extraction-method category.
+
+    pt_only = full.loc[
+        full["meddra_concept_type"].eq("PT")
     ].copy()
 
-    removed_empty = before - len(out)
+    # This additional view is more conservative:
+    # only NLP-classified indication records
+    # with PT-level disease concepts.
 
-    before_dup = len(out)
+    nlp_pt = pt_only.loc[
+        pt_only[
+            "extraction_method"
+        ].str.casefold().eq("nlp_indication")
+    ].copy()
 
-    out = out.drop_duplicates(
-        subset=[
-            "drug_identifier",
-            "disease_or_condition_identifier",
-            "disease_or_condition_name",
-            "relationship_type",
-            "meddra_concept_type",
-            "extraction_method",
+    unmatched = (
+        full.loc[
+            full["drug_name_match_status"].ne("matched")
         ]
-    ).reset_index(drop=True)
-
-    removed_duplicates = before_dup - len(out)
-
-    out = out[OUTPUT_COLUMNS]
-
-    print(f"[INPUT ROWS] {len(df):,}")
-    print(f"[OUTPUT ROWS] {len(out):,}")
-    print(f"[REMOVED EMPTY CORE RECORDS] {removed_empty:,}")
-    print(f"[REMOVED DUPLICATES] {removed_duplicates:,}")
-    print(f"[UNIQUE DRUG IDS] {out['drug_identifier'].nunique():,}")
-    print(
-        f"[UNIQUE DRUG NAMES] "
-        f"{out['drug_name'].replace('', pd.NA).nunique(dropna=True):,}"
-    )
-    print(
-        f"[UNIQUE DISEASE IDS] "
-        f"{out['disease_or_condition_identifier'].nunique():,}"
-    )
-    print(
-        f"[UNIQUE DISEASE NAMES] "
-        f"{out['disease_or_condition_name'].nunique():,}"
-    )
-    print(
-        f"[UNIQUE DRUG-DISEASE PAIRS] "
-        f"{out[['drug_identifier', 'disease_or_condition_identifier']].drop_duplicates().shape[0]:,}"
-    )
-
-    # ------------------------------------------------------------
-    # Sanity checks for the known SIDER parsing bug.
-    # ------------------------------------------------------------
-    bad_disease_ids = int(
-        out["disease_or_condition_identifier"].isin(["LLT", "PT"]).sum()
-    )
-
-    bad_drug_ids = int(
-        out["drug_identifier"].str.match(r"^C\d+", na=False).sum()
-    )
-
-    print("\n[SANITY CHECKS]")
-    print(f"[BAD disease identifier is LLT/PT] {bad_disease_ids:,}")
-    print(f"[BAD drug identifier looks like UMLS C-code] {bad_drug_ids:,}")
-
-    if bad_disease_ids > 0:
-        raise RuntimeError(
-            "Parsing error: disease identifier contains LLT/PT. "
-            "The MedDRA concept type column was incorrectly used as disease ID."
+        .groupby(
+            [
+                "drug_identifier",
+                "drug_name_match_status",
+            ],
+            sort=False,
         )
+        .size()
+        .rename("n_indication_rows")
+        .reset_index()
+    )
 
-    if bad_drug_ids > 0:
+    # ========================================================
+    # 5. FINAL COUNTS AND QUALITY CHECKS
+    # ========================================================
+
+    section(
+        "4. ROW CONSERVATION, "
+        "METHODS, AND OUTPUT SCHEMA"
+    )
+
+    print(
+        "Source indication rows:",
+        len(sources),
+    )
+
+    print(
+        "Full output rows:",
+        len(full),
+        "Rejected rows:",
+        len(rejected),
+    )
+
+    print(
+        "Deduplicated assertion rows:",
+        len(dedup),
+    )
+
+    print(
+        "PT rows:",
+        len(pt_only),
+    )
+
+    print(
+        "Strict NLP indication PT rows:",
+        len(nlp_pt),
+    )
+
+    print(
+        "Method counts:",
+        full["extraction_method"]
+        .value_counts()
+        .to_dict(),
+    )
+
+    print(
+        "Relationship counts:",
+        full["relationship_type"]
+        .value_counts()
+        .to_dict(),
+    )
+
+    print(
+        "MedDRA levels:",
+        full["meddra_concept_type"]
+        .value_counts()
+        .to_dict(),
+    )
+
+    print(
+        "Unmatched drug-name rows:",
+        int(
+            full[
+                "drug_name_match_status"
+            ].ne("matched").sum()
+        ),
+    )
+
+    print(
+        "Drug ID validation:",
+        full["drug_identifier_validation"]
+        .value_counts()
+        .to_dict(),
+    )
+
+    print(
+        "Disease ID validation:",
+        full["disease_identifier_validation"]
+        .value_counts()
+        .to_dict(),
+    )
+
+    print(
+        "Core fields:",
+        " | ".join(CORE),
+    )
+
+    print(
+        "Full output fields:",
+        " | ".join(COLS),
+    )
+
+    print(
+        "First mapped record:\n",
+        json.dumps(
+            full.iloc[0].to_dict(),
+            ensure_ascii=False,
+            indent=2,
+        )[:2800],
+    )
+
+    # ========================================================
+    # 6. OUTPUT FILES
+    # ========================================================
+
+    outputs = {
+        args.out.resolve(): full,
+
+        args.dedup_out.resolve(): dedup,
+
+        args.pt_out.resolve(): pt_only,
+
+        args.unmatched_out.resolve(): unmatched,
+
+        args.out.resolve().with_name(
+            "sider_drug_disease_nlp_indication_pt.csv"
+        ): nlp_pt,
+
+        args.out.resolve().with_name(
+            "sider_rejected_rows.csv"
+        ): rejected,
+    }
+
+    if len(outputs) != 6:
         raise RuntimeError(
-            "Parsing error: drug identifier looks like a UMLS disease ID. "
-            "The wrong column was used as drug ID."
+            "Duplicate configured output file paths"
         )
-
-    print("\n[OUTPUT HEAD]")
-    preview_cols = [
-        "drug_name",
-        "drug_identifier",
-        "drug_identifier_type",
-        "disease_or_condition_name",
-        "disease_or_condition_identifier",
-        "disease_or_condition_identifier_type",
-        "relationship_type",
-        "evidence_type",
-        "meddra_concept_type",
-        "extraction_method",
-        "source",
-    ]
-
-    print(out[preview_cols].head(20).to_string(index=False))
-
-    return out
-
-
-def write_csv(df: pd.DataFrame, out_csv: Path) -> None:
-    print_section("Writing SIDER CSV")
-
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(out_csv, index=False, quoting=csv.QUOTE_ALL)
-
-    print(f"[OUTPUT] {out_csv}")
-    print(f"[ROWS] {len(df):,}")
-    print(f"[SIZE] {human_size(out_csv.stat().st_size)}")
-    print(f"[SHA256] {sha256_file(out_csv)}")
-
-
-def write_deduplicated_csv(df: pd.DataFrame, dedup_csv: Path) -> pd.DataFrame:
-    print_section("Writing deduplicated SIDER CSV")
-
-    dedup_cols = [
-        "drug_name",
-        "drug_identifier",
-        "disease_or_condition_name",
-        "disease_or_condition_identifier",
-        "relationship_type",
-        "evidence_type",
-        "meddra_concept_type",
-        "extraction_method",
-    ]
-
-    dedup = df.drop_duplicates(subset=dedup_cols).copy()
-
-    dedup_csv.parent.mkdir(parents=True, exist_ok=True)
-    dedup.to_csv(dedup_csv, index=False, quoting=csv.QUOTE_ALL)
-
-    print(f"[DEDUP OUTPUT] {dedup_csv}")
-    print(f"[DEDUP ROWS] {len(dedup):,}")
-    print(f"[DEDUP SIZE] {human_size(dedup_csv.stat().st_size)}")
-    print(f"[DEDUP SHA256] {sha256_file(dedup_csv)}")
-
-    return dedup
-
-
-def summarise_output(out: pd.DataFrame) -> Dict[str, Any]:
-    print_section("Output validation and summary")
-
-    missing = count_missing_or_empty(out)
-
-    print("[MISSING / EMPTY SUMMARY]")
-    print(missing.to_string(index=False))
-
-    relationship_counts = (
-        out["relationship_type"]
-        .replace("", "Missing")
-        .value_counts()
-        .reset_index()
-    )
-    relationship_counts.columns = ["relationship_type", "n"]
-
-    evidence_type_counts = (
-        out["evidence_type"]
-        .replace("", "Missing")
-        .value_counts()
-        .reset_index()
-    )
-    evidence_type_counts.columns = ["evidence_type", "n"]
-
-    meddra_type_counts = (
-        out["meddra_concept_type"]
-        .replace("", "Missing")
-        .value_counts()
-        .reset_index()
-    )
-    meddra_type_counts.columns = ["meddra_concept_type", "n"]
-
-    extraction_counts = (
-        out["extraction_method"]
-        .replace("", "Missing")
-        .value_counts()
-        .reset_index()
-    )
-    extraction_counts.columns = ["extraction_method", "n"]
-
-    drug_identifier_type_counts = (
-        out["drug_identifier_type"]
-        .replace("", "Missing")
-        .value_counts()
-        .reset_index()
-    )
-    drug_identifier_type_counts.columns = ["drug_identifier_type", "n"]
-
-    disease_identifier_type_counts = (
-        out["disease_or_condition_identifier_type"]
-        .replace("", "Missing")
-        .value_counts()
-        .reset_index()
-    )
-    disease_identifier_type_counts.columns = [
-        "disease_or_condition_identifier_type",
-        "n",
-    ]
-
-    print("\n[RELATIONSHIP TYPE COUNTS]")
-    print(relationship_counts.to_string(index=False))
-
-    print("\n[EVIDENCE TYPE COUNTS]")
-    print(evidence_type_counts.to_string(index=False))
-
-    print("\n[MEDDRA CONCEPT TYPE COUNTS]")
-    print(meddra_type_counts.to_string(index=False))
-
-    print("\n[EXTRACTION METHOD COUNTS]")
-    print(extraction_counts.to_string(index=False))
 
     summary = {
-        "rows": int(len(out)),
-        "columns": list(out.columns),
-        "exact_duplicate_rows": int(out.duplicated().sum()),
-        "unique_drug_identifiers": int(
-            out["drug_identifier"].replace("", pd.NA).nunique(dropna=True)
+        "status": "success",
+        "timestamp_utc": ts(),
+        "source": SOURCE,
+
+        "source_repository":
+            "https://sideeffects.embl.de/download/",
+
+        "license_note": (
+            "Check primary SIDER distribution "
+            "and MedDRA terms before redistribution; "
+            "do not assume unrestricted "
+            "downstream licensing."
         ),
-        "unique_drug_names": int(
-            out["drug_name"].replace("", pd.NA).nunique(dropna=True)
+
+        "source_files": inventory,
+        "source_sha256": hashes,
+
+        "name_table_stats": names_stats,
+        "indications_raw_columns": RAW_KEYS,
+
+        "source_rows": len(sources),
+        "output_rows": len(full),
+        "rejected_rows": len(rejected),
+        "deduplicated_rows": len(dedup),
+
+        "pt_only_rows": len(pt_only),
+        "nlp_indication_pt_rows": len(nlp_pt),
+
+        "drug_name_match_status":
+            full["drug_name_match_status"]
+            .value_counts()
+            .to_dict(),
+
+        "extraction_method_counts":
+            full["extraction_method"]
+            .value_counts()
+            .to_dict(),
+
+        "relationship_type_counts":
+            full["relationship_type"]
+            .value_counts()
+            .to_dict(),
+
+        "meddra_level_counts":
+            full["meddra_concept_type"]
+            .value_counts()
+            .to_dict(),
+
+        "llt_rows_same_cui_as_pt":
+            int(
+                full[
+                    "meddra_llt_same_cui_as_pt"
+                ].eq("True").sum()
+            ),
+
+        "distinct_compound_disease_pairs":
+            len(
+                full[
+                    [
+                        "drug_identifier",
+                        "disease_or_condition_identifier",
+                    ]
+                ].drop_duplicates()
+            ),
+
+        "drug_identifier_validation":
+            full["drug_identifier_validation"]
+            .value_counts()
+            .to_dict(),
+
+        "disease_identifier_validation":
+            full["disease_identifier_validation"]
+            .value_counts()
+            .to_dict(),
+
+        "output_columns": COLS,
+        "dedup_keys": dedup_keys,
+
+        "merge_instructions": (
+            "Use full CSV with relationship_type "
+            "and evidence_type; never treat "
+            "preconditions or text mentions "
+            "as therapeutic indications. "
+            "Use the NLP_indication PT view "
+            "for conservative exploratory analysis."
         ),
-        "unique_disease_identifiers": int(
-            out["disease_or_condition_identifier"]
-            .replace("", pd.NA)
-            .nunique(dropna=True)
+
+        "name_join": (
+            "Exact STITCH CID key: "
+            "indications.raw_col_0 "
+            "-> drug_names.column_0"
         ),
-        "unique_disease_names": int(
-            out["disease_or_condition_name"]
-            .replace("", pd.NA)
-            .nunique(dropna=True)
+
+        "pt_only_view_semantics": (
+            "ALL extraction methods, PT level; "
+            "NOT a strict indication-only dataset"
         ),
-        "unique_drug_disease_pairs": int(
-            out[
-                [
-                    "drug_identifier",
-                    "disease_or_condition_identifier",
-                ]
-            ]
-            .drop_duplicates()
-            .shape[0]
-        ),
-        "missing_or_empty_summary": missing.to_dict(orient="records"),
-        "relationship_type_counts": relationship_counts.to_dict(orient="records"),
-        "evidence_type_counts": evidence_type_counts.to_dict(orient="records"),
-        "meddra_concept_type_counts": meddra_type_counts.to_dict(orient="records"),
-        "extraction_method_counts": extraction_counts.to_dict(orient="records"),
-        "drug_identifier_type_counts": drug_identifier_type_counts.to_dict(
-            orient="records"
-        ),
-        "disease_identifier_type_counts": disease_identifier_type_counts.to_dict(
-            orient="records"
-        ),
-        "output_head": out.head(20).to_dict(orient="records"),
     }
 
-    print("\n[SUMMARY]")
-    for key in [
-        "rows",
-        "exact_duplicate_rows",
-        "unique_drug_identifiers",
-        "unique_drug_names",
-        "unique_disease_identifiers",
-        "unique_disease_names",
-        "unique_drug_disease_pairs",
-    ]:
-        print(f"{key}: {summary[key]}")
-
-    return summary
-
-
-def write_metadata(metadata_path: Path, metadata: Dict[str, Any]) -> None:
-    metadata_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with open(metadata_path, "w", encoding="utf-8") as f:
-        json.dump(metadata, f, indent=2, default=str)
-
-    print_section("METADATA WRITTEN")
-    print(metadata_path)
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Download and process SIDER 4.1 drug-indication mappings "
-            "into the unified multi-source drug-disease schema."
-        )
-    )
-
-    parser.add_argument(
-        "--workdir",
-        default=str(RAW_DIR),
-        help="Directory for downloaded SIDER files.",
-    )
-
-    parser.add_argument(
-        "--out",
-        default=str(OUTPUT_FILE),
-        help="Output unified CSV path.",
-    )
-
-    parser.add_argument(
-        "--dedup_out",
-        default=str(DEDUP_FILE),
-        help="Output deduplicated unified CSV path.",
-    )
-
-    parser.add_argument(
-        "--metadata",
-        default=str(SUMMARY_FILE),
-        help="Output metadata JSON path.",
-    )
-
-    parser.add_argument(
-        "--force_download",
-        action="store_true",
-        help="Force re-download of SIDER files.",
-    )
-
-    args = parser.parse_args()
-
-    workdir = Path(args.workdir).resolve()
-    out_csv = Path(args.out).resolve()
-    dedup_csv = Path(args.dedup_out).resolve()
-    metadata_path = Path(args.metadata).resolve()
-
-    metadata: Dict[str, Any] = {
-        "script": "sider.py",
-        "source": SOURCE_NAME,
-        "started_at_utc": now_utc(),
-        "status": "started",
-        "project_root": str(PROJECT_ROOT),
-        "raw_dir": str(workdir),
-        "output_file": str(out_csv),
-        "deduplicated_output_file": str(dedup_csv),
-        "metadata_file": str(metadata_path),
-        "download_base_url_candidates": BASE_URL_CANDIDATES,
-        "files": FILES,
-        "relationship_type": "indication",
-        "evidence_type": "sider_label_derived_indication",
-        "interpretation": (
-            "SIDER 4.1 is derived from marketed drug labels/package inserts. "
-            "The meddra_all_indications file is interpreted as label-derived "
-            "drug-indication/phenotype evidence, not direct therapeutic efficacy "
-            "or proof of regulatory approval."
-        ),
-        "correct_schema": {
-            "raw_col_0": "drug_id",
-            "raw_col_1": "source_concept_id",
-            "raw_col_2": "extraction_method",
-            "raw_col_3": "source_concept_name",
-            "raw_col_4": "meddra_concept_type",
-            "raw_col_5": "disease_id",
-            "raw_col_6": "disease_name",
-        },
-        "unified_output_columns": OUTPUT_COLUMNS,
-    }
+    staged = {}
 
     try:
-        print_section("SIDER 4.1 -> unified drug-disease / indication CSV")
-        print(f"[WORKDIR]  {workdir}")
-        print(f"[OUTPUT]   {out_csv}")
-        print(f"[DEDUP]    {dedup_csv}")
-        print(f"[METADATA] {metadata_path}")
+        # Stage every output before replacement.
 
-        print_section("Downloading SIDER files")
+        for dest, frame in outputs.items():
+            staged[dest] = write_staged(
+                frame,
+                dest,
+            )
 
-        drug_names_path, drug_names_url = download_with_fallback(
-            FILES["drug_names"],
-            workdir / FILES["drug_names"],
-            force=args.force_download,
+        summary["output_files_sha256"] = {
+            str(dest): hash_file(tmp)
+            for dest, tmp in staged.items()
+        }
+
+        meta_path = args.metadata.resolve()
+
+        if meta_path in staged:
+            raise RuntimeError(
+                "Metadata path overlaps a CSV"
+            )
+
+        meta_path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
         )
 
-        indications_path, indications_url = download_with_fallback(
-            FILES["indications"],
-            workdir / FILES["indications"],
-            force=args.force_download,
+        meta_tmp = meta_path.with_name(
+            meta_path.name + ".processing.tmp"
         )
 
-        metadata["downloads"] = {
-            "drug_names": {
-                "url": drug_names_url,
-                "path": str(drug_names_path),
-                "size_bytes": drug_names_path.stat().st_size,
-                "sha256": sha256_file(drug_names_path),
-            },
-            "indications": {
-                "url": indications_url,
-                "path": str(indications_path),
-                "size_bytes": indications_path.stat().st_size,
-                "sha256": sha256_file(indications_path),
-            },
-        }
+        meta_tmp.write_text(
+            json.dumps(
+                summary,
+                indent=2,
+                ensure_ascii=False,
+            ) + "\n",
+            encoding="utf-8",
+        )
 
-        drug_names_df, drug_name_map = load_drug_names(drug_names_path)
-        indications_df = load_indications(indications_path)
+        staged[meta_path] = meta_tmp
 
-        metadata["input_summary"] = {
-            "drug_names_rows": int(len(drug_names_df)),
-            "drug_names_unique_drug_ids": int(
-                drug_names_df["drug_id"].nunique()
-            ),
-            "indications_rows": int(len(indications_df)),
-            "indications_columns": list(indications_df.columns),
-        }
+        section(
+            "5. REPLACING FILES "
+            "IN ORIGINAL PROCESSED DIRECTORY"
+        )
 
-        out = build_output(indications_df, drug_name_map)
+        for dest, tmp in staged.items():
+            tmp.replace(dest)
 
-        if out.empty:
-            raise RuntimeError("SIDER output is empty after processing.")
+            print(
+                "[OVERWRITTEN]",
+                dest,
+            )
 
-        write_csv(out, out_csv)
-        dedup = write_deduplicated_csv(out, dedup_csv)
+        print(
+            "SUCCESS: use sider_drug_disease.csv "
+            "for the evidence-preserving merge."
+        )
 
-        metadata["output"] = {
-            "path": str(out_csv),
-            "rows": int(len(out)),
-            "size_bytes": out_csv.stat().st_size,
-            "sha256": sha256_file(out_csv),
-        }
-
-        metadata["deduplicated_output"] = {
-            "path": str(dedup_csv),
-            "rows": int(len(dedup)),
-            "size_bytes": dedup_csv.stat().st_size,
-            "sha256": sha256_file(dedup_csv),
-        }
-
-        metadata["output_summary"] = summarise_output(out)
-
-        metadata["finished_at_utc"] = now_utc()
-        metadata["status"] = "success"
-
-        print_section("DONE")
-        print("[SUCCESS] Unified SIDER drug-disease / indication mapping generated.")
-        print(f"[CSV]      {out_csv}")
-        print(f"[DEDUP]    {dedup_csv}")
-        print(f"[METADATA] {metadata_path}")
-
-    except Exception as e:
-        metadata["finished_at_utc"] = now_utc()
-        metadata["status"] = "failed"
-        metadata["error"] = repr(e)
-
-        print_section("FAILED")
-        print(repr(e))
-
-        raise
+        print(
+            "For conservative candidate indications, "
+            "use sider_drug_disease_nlp_indication_pt.csv."
+        )
 
     finally:
-        write_metadata(metadata_path, metadata)
+        for tmp in staged.values():
+            tmp.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
